@@ -117,7 +117,7 @@ def train(args):
         
         # Init Agent
         # Calculate Total Timesteps for Scheduler
-        total_updates = int(configs.max_episodes / configs.update_every_episodes * configs.k_epochs)
+        total_updates = int(configs.max_episodes / configs.update_every_episodes)
 
         agent = PPOAgent(
             model=model,

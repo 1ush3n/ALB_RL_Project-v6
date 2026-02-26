@@ -436,10 +436,9 @@ class PPOAgent:
                     entropy[valid_step] += dist.entropy()[valid_step]
                     
                     # Update mask for next worker in team
-                    for b in range(target.size(0)):
-                        if valid_step[b]:
-                            curr_mask = curr_mask.clone()
-                            curr_mask[b, target[b]] = True
+                    curr_mask = curr_mask.clone()
+                    valid_b_indices = torch.nonzero(valid_step).squeeze(-1)
+                    curr_mask[valid_b_indices, target[valid_step]] = True
                             
                 total_lp = task_lp + station_lp + team_lp
                 
