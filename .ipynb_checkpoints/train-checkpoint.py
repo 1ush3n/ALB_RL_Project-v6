@@ -10,13 +10,13 @@ import argparse
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ALB_RL_Project.environment import AirLineEnv_Graph
-from ALB_RL_Project.models.hb_gat_pn import HBGATPN
-from ALB_RL_Project.ppo_agent import PPOAgent
-from ALB_RL_Project.configs import configs
+from environment import AirLineEnv_Graph
+from models.hb_gat_pn import HBGATPN
+from ppo_agent import PPOAgent
+from configs import configs
 import pandas as pd
-from ALB_RL_Project.baseline_ga import GeneticAlgorithmScheduler
-from ALB_RL_Project.utils.visualization import plot_gantt
+from baseline_ga import GeneticAlgorithmScheduler
+from utils.visualization import plot_gantt
 
 # ---------------------------------------------------------------------------
 # 经验回放缓冲区 (Memory Buffer)

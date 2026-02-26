@@ -10,11 +10,10 @@ import pandas as pd
 import heapq
 import networkx as nx 
 
-# 添加项目根目录到路径，以便找到 data_loader
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# (Removed hardcoded sys.path.append to comply with standard project struct)
 
-from ALB_RL_Project.data_loader import load_data
-from ALB_RL_Project.configs import configs
+from data_loader import load_data
+from configs import configs
 
 # Event Definition
 # time: Event occur time
@@ -231,8 +230,7 @@ class AirLineEnv_Graph(gym.Env):
         self.base_data = data
         self.obs_data = None # 将在 reset 中 clone
         
-        # [Phase 3.1: O(1) In-place Observation Initialization]
-        # 预先分配静态底座张量，避免 step 过程中不断进行代价高昂的 torch.cat 与内存申请
+        # 预先分配静态底座张量，避免 step 过程中不断进行内存申请
         self.base_task_x = torch.zeros((self.num_tasks, 17))
         self.base_task_x[:, 0:1] = dur / 100.0
         
@@ -259,7 +257,7 @@ class AirLineEnv_Graph(gym.Env):
         self.task_station_map = {} 
         self.task_end_times = -np.ones(self.num_tasks) 
         
-        # [Speed Optimization V2] True O(1) Memory Pre-allocation
+        # 预分配边的内存空间
         MAX_TS_EDGES = self.num_tasks
         MAX_TW_EDGES = self.num_tasks * self.num_workers
         self.edge_ts_mem = torch.zeros((2, MAX_TS_EDGES), dtype=torch.long)
@@ -437,7 +435,6 @@ class AirLineEnv_Graph(gym.Env):
         
         self.assigned_tasks.append((task_id, station_id, team, start_time, finish_time))
         
-        # [Speed Optimization V2] Zero-Python-Overhead Array Assignment
         if station_id != -1: # exclude virtual zero-duration
             ts_ptr = self.edge_ts_cnt
             self.edge_ts_mem[0, ts_ptr] = task_id
@@ -495,7 +492,7 @@ class AirLineEnv_Graph(gym.Env):
         # 记录执行后的 makespan
         new_makespan = np.max(self.station_loads)
         delta_makespan = new_makespan - prev_makespan
-        delta_makespan_clipped = np.clip(delta_makespan, -20.0, 20.0)
+        delta_makespan_clipped = np.clip(delta_makespan, -50.0, 50.0)
         reward -= getattr(configs, 'r_coef_makespan', 0.5) * delta_makespan_clipped
         
         # E. 终局奖励 (Final Reward)
@@ -599,8 +596,7 @@ class AirLineEnv_Graph(gym.Env):
         
         ready_indices = np.where(self.task_status == 1)[0]
         
-        # [Phase 3.2: O(1) Mask Engine]
-        # 使用向量化计算直接替代 O(W*S) 的 Python 计数循环
+        # 使用向量化计算获取空闲技能可用量
         if (~worker_mask_np).any():
             avail_skills = self.worker_skill_matrix[~worker_mask_np].sum(dim=0).numpy()
         else:
@@ -688,10 +684,7 @@ class AirLineEnv_Graph(gym.Env):
         return data
 
     def get_state_snapshot(self):
-        """
-        [Phase 3.3: Snapshot Streaming]
-        生成状态轻量级切片放入内存 Buffer。
-        """
+        """生成状态轻量级切片以存入 Buffer。"""
         return {
             'task_status': self.task_status.copy(),
             'worker_free_time': self.worker_free_time.copy(),
@@ -705,9 +698,7 @@ class AirLineEnv_Graph(gym.Env):
         
     def rebuild_state_from_snapshot(self, snapshot):
         """
-        [Phase 3.3: Snapshot Streaming]
-        PPO 更新时基于快照恢复成 PyG 图结构。
-        避免了千兆级无用异构图特征缓存占满显存内存的问题。
+        基于快照恢复成 PyG 图结构，避免完整异构图深拷贝带来的极高缓存占用。
         """
         data = self.base_data.clone()
         

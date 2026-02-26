@@ -1,18 +1,16 @@
 
 import os
-import sys
 import torch
 import pandas as pd
 import numpy as np
 import glob
 
-# Add project root
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# (Removed hardcoded sys.path.append to comply with standard project struct)
 
-from ALB_RL_Project.environment import AirLineEnv_Graph
-from ALB_RL_Project.models.hb_gat_pn import HBGATPN
-from ALB_RL_Project.ppo_agent import PPOAgent
-from ALB_RL_Project.configs import configs
+from environment import AirLineEnv_Graph
+from models.hb_gat_pn import HBGATPN
+from ppo_agent import PPOAgent
+from configs import configs
 
 def find_latest_checkpoint(model_dir):
     list_of_files = glob.glob(os.path.join(model_dir, '*.pth')) 
@@ -35,7 +33,7 @@ def generate_schedule(model_path=None):
     model = HBGATPN(configs).to(device)
     
     if model_path is None:
-        model_dir = "ALB_RL_Project/models"
+        model_dir = "models"
         model_path = find_latest_checkpoint(model_dir)
         
     if model_path and os.path.exists(model_path):

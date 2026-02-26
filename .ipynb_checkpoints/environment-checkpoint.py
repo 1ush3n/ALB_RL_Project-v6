@@ -13,8 +13,8 @@ import networkx as nx
 # 添加项目根目录到路径，以便找到 data_loader
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ALB_RL_Project.data_loader import load_data
-from ALB_RL_Project.configs import configs
+from data_loader import load_data
+from configs import configs
 
 # Event Definition
 # time: Event occur time

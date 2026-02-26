@@ -4,8 +4,8 @@ from torch.distributions import Categorical
 from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
 import math
-from ALB_RL_Project.configs import configs
-from ALB_RL_Project.utils.muon import Muon
+from configs import configs
+from utils.muon import Muon
 class PPOAgent:
     """
     PPO (Proximal Policy Optimization) 智能体。

@@ -8,11 +8,11 @@ import pandas as pd
 # Add project root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ALB_RL_Project.environment import AirLineEnv_Graph
-from ALB_RL_Project.models.hb_gat_pn import HBGATPN
-from ALB_RL_Project.ppo_agent import PPOAgent
-from ALB_RL_Project.configs import configs
-from ALB_RL_Project.utils.visualization import plot_gantt
+from environment import AirLineEnv_Graph
+from models.hb_gat_pn import HBGATPN
+from ppo_agent import PPOAgent
+from configs import configs
+from utils.visualization import plot_gantt
 
 def evaluate(args):
     print("--- Starting Evaluation ---")

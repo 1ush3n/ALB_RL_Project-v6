@@ -34,7 +34,7 @@ class configs:
     gamma = 0.99                    # 折扣因子 (Discount Factor)
     k_epochs = 4                    # 每次更新循环次数 (PPO Update Epochs)
     eps_clip = 0.2                  # PPO Clip阈值 (e.g. 0.1 ~ 0.2)
-    batch_size = 128                 # PPO update batch size (小批量更新)
+    batch_size = 2                 # PPO update batch size (小批量更新)
     
     # [Loss Balancing & Critic Isolation 2026-02-22]
     c_policy = 1.0                  # Policy Loss 权重
@@ -47,7 +47,7 @@ class configs:
     
     # [Training Control Parameters 2026-02-12]
     max_episodes = 200             # 最大训练 Episode 数
-    update_every_episodes = 4       # 多少个 Episode 收集一次数据进行 PPO 更新
+    update_every_episodes = 2       # 多少个 Episode 收集一次数据进行 PPO 更新
     eval_freq = 10                  # 多少个 Episode 进行一次评估
     eval_temperature = 0.0         # 评估/推理时的采样温度 (0.0 表示确定的 Argmax 贪婪策略)
     

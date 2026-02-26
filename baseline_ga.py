@@ -7,10 +7,10 @@ import argparse
 import sys
 import os
 
-# 导入项目环境
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ALB_RL_Project.environment import AirLineEnv_Graph
-from ALB_RL_Project.configs import configs
+# (Removed hardcoded sys.path.append to comply with standard project struct)
+
+from environment import AirLineEnv_Graph
+from configs import configs
 
 class GeneticAlgorithmScheduler:
     """

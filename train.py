@@ -8,15 +8,15 @@ import traceback
 import argparse
 
 # 添加项目根目录到路径
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# (Removed hardcoded sys.path.append to comply with standard project struct)
 
-from ALB_RL_Project.environment import AirLineEnv_Graph
-from ALB_RL_Project.models.hb_gat_pn import HBGATPN
-from ALB_RL_Project.ppo_agent import PPOAgent
-from ALB_RL_Project.configs import configs
+from environment import AirLineEnv_Graph
+from models.hb_gat_pn import HBGATPN
+from ppo_agent import PPOAgent
+from configs import configs
 import pandas as pd
-from ALB_RL_Project.baseline_ga import GeneticAlgorithmScheduler
-from ALB_RL_Project.utils.visualization import plot_gantt
+from baseline_ga import GeneticAlgorithmScheduler
+from utils.visualization import plot_gantt
 
 # ---------------------------------------------------------------------------
 # 经验回放缓冲区 (Memory Buffer)
@@ -139,7 +139,7 @@ def train(args):
         
         # 3. 断点续训 (Resume Training)
         start_episode = 1
-        model_dir = "ALB_RL_Project/models"
+        model_dir = "models"
         os.makedirs(model_dir, exist_ok=True)
         checkpoint_path = os.path.join(model_dir, "latest_checkpoint.pth")
         
@@ -156,7 +156,9 @@ def train(args):
         
         # 最佳模型记录
         best_makespan = float('inf')
-        best_model_path = os.path.join(model_dir, "best_model.pth")
+        best_model_dir = os.path.join(model_dir, "bestmodel")
+        os.makedirs(best_model_dir, exist_ok=True)
+        best_model_path = os.path.join(best_model_dir, "best_model.pth")
         
         # 4. TensorBoard 设置
         run_name = f"ALB_PPO_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
