@@ -48,7 +48,7 @@ class configs:
     # [Training Control Parameters 2026-02-12]
     max_episodes = 200             # 最大训练 Episode 数
     update_every_episodes = 2       # 多少个 Episode 收集一次数据进行 PPO 更新
-    eval_freq = 10                  # 多少个 Episode 进行一次评估
+    eval_freq = 2                  # 多少个 Episode 进行一次评估
     eval_temperature = 0.0         # 评估/推理时的采样温度 (0.0 表示确定的 Argmax 贪婪策略)
     
     # [Learning Rate Schedule]

@@ -41,7 +41,7 @@ class PPOAgent:
         self.accumulation_steps = getattr(configs, 'accumulation_steps', 1)
         self.gae_lambda = getattr(configs, 'gae_lambda', 0.95)
         
-        self.MseLoss = nn.SmoothL1Loss() # 替换成 Huber Loss 防止 Reward 等大幅度数值引起的显式 Loss 爆炸
+        self.MseLoss = nn.MSELoss() # 回归标准 MSE，强制 Critic 网络具有针对大数值误差的抛物线追赶能力
         
         # [LR Scheduler Setup]
         # Linear Warmup + Cosine Annealing
@@ -56,10 +56,14 @@ class PPOAgent:
             if current_step < self.lr_warmup_steps:
                 return float(current_step) / float(max(1, self.lr_warmup_steps))
             
-            # 2. Cosine Decay Phase
-            progress = float(current_step - self.lr_warmup_steps) / float(max(1, self.total_timesteps - self.lr_warmup_steps))
-            progress = min(1.0, max(0.0, progress)) # Clamp [0, 1]
+            # 2. SGDR (Cosine Annealing with Warm Restarts) Phase
+            step_after_warmup = current_step - self.lr_warmup_steps
+            T_0 = 40  # 第一周期步长 (对应 80 episode, 因为每 2 episode 更新一次)
             
+            curr_cycle_step = step_after_warmup % T_0
+            progress = float(curr_cycle_step) / float(T_0)
+            
+            # 余弦衰减，到底部直接重启
             cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
             
             # Scaling: range [min_lr/lr, 1.0]
@@ -458,16 +462,9 @@ class PPOAgent:
                 c_ent = getattr(configs, 'c_entropy', 0.01)
                 c_pol = getattr(configs, 'c_policy', 1.0)
                 
-                # [Added] PPO Value Loss Clipping (Restricting extreme jumps in Value predictions)
+                # [Removed Value Clipping] 因为环境的回报本身大且未缩放（如-500），限制单次预测改变0.2会导致 Critic 永久瘫痪！
                 b_reward = batch.y_reward.view(-1)
-                v_loss_unclipped = self.MseLoss(state_values, b_reward)
-                if hasattr(batch, 'y_value'):
-                     b_value = batch.y_value.view(-1)
-                     v_clipped = b_value + torch.clamp(state_values - b_value, -self.eps_clip, self.eps_clip)
-                     v_loss_clipped = self.MseLoss(v_clipped, b_reward)
-                     value_loss = c_val * torch.max(v_loss_unclipped, v_loss_clipped)
-                else:
-                     value_loss = c_val * v_loss_unclipped
+                value_loss = c_val * self.MseLoss(state_values, b_reward)
                      
                 entropy_loss = -c_ent * entropy.mean()
                 

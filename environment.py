@@ -492,8 +492,8 @@ class AirLineEnv_Graph(gym.Env):
         # 记录执行后的 makespan
         new_makespan = np.max(self.station_loads)
         delta_makespan = new_makespan - prev_makespan
-        delta_makespan_clipped = np.clip(delta_makespan, -50.0, 50.0)
-        reward -= getattr(configs, 'r_coef_makespan', 0.5) * delta_makespan_clipped
+        # 移除截断，防止发生突破上限后不受惩罚的漏洞
+        reward -= getattr(configs, 'r_coef_makespan', 0.5) * delta_makespan
         
         # E. 终局奖励 (Final Reward)
         done = (len(self.assigned_tasks) == self.num_tasks)
