@@ -231,7 +231,9 @@ class PPOAgent:
             total_worker_logprob = sum(worker_logprobs) if worker_logprobs else torch.tensor(0.0).to(self.device)
             
             action_logprob = task_logprob + station_logprob + total_worker_logprob
-            state_value = self.policy.get_value(global_context)
+            # [CRITICAL FIX] 物理隔离隔离 Critic 防止其巨大的 Value Error 梯度捣毁底层共享 GAT 拓扑特征 (灾难性干扰致盲)
+            # state_value = self.policy.get_value(global_context)
+            state_value = self.policy.get_value(global_context.detach())
             
             action_tuple = (t_idx, station_action.item(), team_indices)
             
@@ -357,7 +359,9 @@ class PPOAgent:
                 
                 # 当前策略的前向传播
                 x_dict, global_context = self.policy(batch)
-                state_values = self.policy.get_value(global_context).view(-1)
+                # [CRITICAL FIX: Critic Detachment]
+                # state_values = self.policy.get_value(global_context).view(-1)
+                state_values = self.policy.get_value(global_context.detach()).view(-1)
                 
                 # --- Re-evaluate LogProbs ---
                 # A. Task LogProb

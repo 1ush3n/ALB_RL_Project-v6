@@ -39,7 +39,9 @@ class configs:
     # [Loss Balancing & Critic Isolation 2026-02-22]
     c_policy = 1.0                  # Policy Loss 权重
     c_value = 0.5                   # Value Loss 权重 (降低预估误差的主宰)
-    c_entropy = 0.02                # Entropy Loss 权重 (提高探索度)
+    # [2026-02-27] Reduce Entropy to force network out of the random uniform policy (blindness)
+    # c_entropy = 0.02                # Entropy Loss 权重 (提高探索度)
+    c_entropy = 0.005                 # 降低 Entropy 强迫网络尽快形成固定且高效的分配路线
     # [Advanced Training Features 2026-02-20]
     accumulation_steps = 2          # 梯度累积步长 (在 batch_size=16 时，实际更新等效为 64)
     gae_lambda = 0.95               # GAE 优势函数的衰减因子 (0~1 之间，越小方差越小、偏差越大)
