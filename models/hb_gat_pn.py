@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import HeteroConv, GATv2Conv, Linear, global_mean_pool
+from torch_geometric.nn import HeteroConv, GATv2Conv, Linear, global_mean_pool, global_max_pool
 
 # ---------------------------------------------------------------------------
 # 特征嵌入模块 (Feature Embedder)
@@ -92,7 +92,8 @@ class HeteroGATEncoder(nn.Module):
 class TaskPointer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.context_proj = nn.Linear(config.hidden_dim * 3, config.hidden_dim)
+        # self.context_proj = nn.Linear(config.hidden_dim * 3, config.hidden_dim)
+        self.context_proj = nn.Linear(config.hidden_dim * 6, config.hidden_dim) # 扩展为 Mean+Max 拼接后的 6 倍维度
         self.task_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.attn = nn.Linear(config.hidden_dim, 1)
 
@@ -194,8 +195,13 @@ class HBGATPN(nn.Module):
         
         # 3. 价值网络 (Critic) 
         # 用于 PPO 的 Advantage 计算
+        # self.critic = nn.Sequential(
+        #     nn.Linear(config.hidden_dim * 3, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, 1)
+        # )
         self.critic = nn.Sequential(
-            nn.Linear(config.hidden_dim * 3, 64),
+            nn.Linear(config.hidden_dim * 6, 64), # 扩展为 Mean+Max 拼接后的 6 倍维度
             nn.ReLU(),
             nn.Linear(64, 1)
         )
@@ -209,17 +215,39 @@ class HBGATPN(nn.Module):
         x_dict = self.embedder(batch_data.x_dict)
         x_dict_encoded = self.encoder(x_dict, batch_data.edge_index_dict)
         
-        # Global Context: 对 Station, Task, Worker 节点进行 Mean Pooling, 实现全视角的 Context
+        # Global Context: 对 Station, Task, Worker 节点进行 Mean + Max Pooling, 实现全视角及瓶颈感知
         if hasattr(batch_data['station'], 'batch') and batch_data['station'].batch is not None:
-             station_ctx = global_mean_pool(x_dict_encoded['station'], batch_data['station'].batch)
-             task_ctx = global_mean_pool(x_dict_encoded['task'], batch_data['task'].batch)
-             worker_ctx = global_mean_pool(x_dict_encoded['worker'], batch_data['worker'].batch)
-             global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1) # [B, H*3]
+             # 原代码：
+             # station_ctx = global_mean_pool(x_dict_encoded['station'], batch_data['station'].batch)
+             # task_ctx = global_mean_pool(x_dict_encoded['task'], batch_data['task'].batch)
+             # worker_ctx = global_mean_pool(x_dict_encoded['worker'], batch_data['worker'].batch)
+             # global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1) # [B, H*3]
+             
+             station_mean = global_mean_pool(x_dict_encoded['station'], batch_data['station'].batch)
+             task_mean = global_mean_pool(x_dict_encoded['task'], batch_data['task'].batch)
+             worker_mean = global_mean_pool(x_dict_encoded['worker'], batch_data['worker'].batch)
+             
+             station_max = global_max_pool(x_dict_encoded['station'], batch_data['station'].batch)
+             task_max = global_max_pool(x_dict_encoded['task'], batch_data['task'].batch)
+             worker_max = global_max_pool(x_dict_encoded['worker'], batch_data['worker'].batch)
+             
+             global_context = torch.cat([station_mean, task_mean, worker_mean, station_max, task_max, worker_max], dim=1) # [B, H*6]
         else:
-             station_ctx = torch.mean(x_dict_encoded['station'], dim=0, keepdim=True)
-             task_ctx = torch.mean(x_dict_encoded['task'], dim=0, keepdim=True)
-             worker_ctx = torch.mean(x_dict_encoded['worker'], dim=0, keepdim=True)
-             global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1)
+             # 原代码：
+             # station_ctx = torch.mean(x_dict_encoded['station'], dim=0, keepdim=True)
+             # task_ctx = torch.mean(x_dict_encoded['task'], dim=0, keepdim=True)
+             # worker_ctx = torch.mean(x_dict_encoded['worker'], dim=0, keepdim=True)
+             # global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1)
+             
+             station_mean = torch.mean(x_dict_encoded['station'], dim=0, keepdim=True)
+             task_mean = torch.mean(x_dict_encoded['task'], dim=0, keepdim=True)
+             worker_mean = torch.mean(x_dict_encoded['worker'], dim=0, keepdim=True)
+             
+             station_max = torch.max(x_dict_encoded['station'], dim=0, keepdim=True)[0]
+             task_max = torch.max(x_dict_encoded['task'], dim=0, keepdim=True)[0]
+             worker_max = torch.max(x_dict_encoded['worker'], dim=0, keepdim=True)[0]
+             
+             global_context = torch.cat([station_mean, task_mean, worker_mean, station_max, task_max, worker_max], dim=1)
              
         return x_dict_encoded, global_context
 

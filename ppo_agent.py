@@ -58,7 +58,7 @@ class PPOAgent:
             
             # 2. SGDR (Cosine Annealing with Warm Restarts) Phase
             step_after_warmup = current_step - self.lr_warmup_steps
-            T_0 = 40  # 第一周期步长 (对应 80 episode, 因为每 2 episode 更新一次)
+            T_0 = getattr(configs, 'sgdr_t0', 40)  # 第一周期步长 (由配置项控制)
             
             curr_cycle_step = step_after_warmup % T_0
             progress = float(curr_cycle_step) / float(T_0)

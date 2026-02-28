@@ -38,7 +38,8 @@ class configs:
     
     # [Loss Balancing & Critic Isolation 2026-02-22]
     c_policy = 1.0                  # Policy Loss 权重
-    c_value = 0.5                   # Value Loss 权重 (降低预估误差的主宰)
+    # c_value = 0.5                   # Value Loss 权重 (降低预估误差的主宰)
+    c_value = 0.05                  # [缓解高误差] 听从用户建议：大幅降低 Value权重，削弱剧烈震荡对整体优化的干扰
     # [2026-02-27] Reduce Entropy to force network out of the random uniform policy (blindness)
     # c_entropy = 0.02                # Entropy Loss 权重 (提高探索度)
     c_entropy = 0.005                 # 降低 Entropy 强迫网络尽快形成固定且高效的分配路线
@@ -46,6 +47,8 @@ class configs:
     accumulation_steps = 2          # 梯度累积步长 (在 batch_size=16 时，实际更新等效为 64)
     gae_lambda = 0.95               # GAE 优势函数的衰减因子 (0~1 之间，越小方差越小、偏差越大)
     use_muon = True                 # 是否使用 Muon 优化器进行 2D 张量的更新
+    # [SGDR Learning Rate Schedule]
+    sgdr_t0 = 40                    # Cosine Annealing 热重启周期 (建议在多节点大图中延长此至 100+)
     
     # [Training Control Parameters 2026-02-12]
     max_episodes = 200             # 最大训练 Episode 数
