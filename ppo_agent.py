@@ -466,9 +466,9 @@ class PPOAgent:
                 c_ent = getattr(configs, 'c_entropy', 0.01)
                 c_pol = getattr(configs, 'c_policy', 1.0)
                 
-                # [Removed Value Clipping] 因为环境的回报本身大且未缩放（如-500），限制单次预测改变0.2会导致 Critic 永久瘫痪！
+                # [CRITICAL FIX: Huber Loss] 使用 Huber Loss 替代 MSE，当预测误差过大（如数千万）时线性回传梯度，防止 Critic 巨型梯度经 clip 后将 Policy 梯度抹零致盲
                 b_reward = batch.y_reward.view(-1)
-                value_loss = c_val * self.MseLoss(state_values, b_reward)
+                value_loss = c_val * torch.nn.functional.huber_loss(state_values, b_reward, delta=10.0)
                      
                 entropy_loss = -c_ent * entropy.mean()
                 

@@ -4,12 +4,12 @@ class configs:
     # 路径配置 (Paths)
     # ------------------
     # 默认数据路径 (如果没有通过命令行参数指定)
-    data_file_path = "100.csv" 
+    data_file_path = "3000.csv" 
     
     # ------------------
     # 环境与图相关 (Environment & Graph)
     # ------------------
-    n_j = 715                      # 任务(工序)数量估计 (Graph Nodes)
+    n_j = 3300                     # 任务(工序)数量估计 (Graph Nodes)
     n_m = 5                        # 站位数量 (Stations)
     n_w = 30                        # 工人数量 (Workers)
                                     # 注意：实际任务数由 data_loader 动态加载，此处仅作参考或 Embedding 初始化上界
@@ -36,28 +36,27 @@ class configs:
     # ------------------
     # PPO 训练超参数 (PPO Training)
     # ------------------
-    lr = 1e-4                       # 初始学习率 (Learning Rate)
-    gamma = 0.99                    # 折扣因子 (Discount Factor)
-    k_epochs = 4                    # 每次更新循环次数 (PPO Update Epochs)
+    lr = 1e-4                       # 初始学习率 (3000节点序列极长，不可轻易放大以免陷入局部最优死坑)
+    gamma = 0.9995                  # [治病良方：时间折现因子] 3000步超级长线，必须将远视能力拉满！(1 / (1-0.9995) = 2000步视野)
+    k_epochs = 2                    # 每次更新循环次数 (每次少吸取一点教训，防止把错误的局部真理当做全局真理)
     eps_clip = 0.2                  # PPO Clip阈值 (e.g. 0.1 ~ 0.2)
-    batch_size = 2                 # PPO update batch size (小批量更新)
+    batch_size = 16                 # [防 OOM] 严重缩编 Batch Size，避免激活矩阵爆炸!
     
     # [Loss Balancing & Critic Isolation 2026-02-22]
     c_policy = 1.0                  # Policy Loss 权重
-    # c_value = 0.5                   # Value Loss 权重 (降低预估误差的主宰)
-    c_value = 0.05                  # [缓解高误差] 听从用户建议：大幅降低 Value权重，削弱剧烈震荡对整体优化的干扰
+    c_value = 0.5                   # [已通过 Huber Loss 防爆] 安全调回标准的 0.5，Critic 不会再破坏全局梯度
     # [2026-02-27] Reduce Entropy to force network out of the random uniform policy (blindness)
-    # c_entropy = 0.02                # Entropy Loss 权重 (提高探索度)
-    c_entropy = 0.005                 # 降低 Entropy 强迫网络尽快形成固定且高效的分配路线
+    # [针对 3000 单的长序列防死锁补丁] 面对巨量状态，初期随机性非常关键。不可过低。
+    c_entropy = 0.05                
     # [Advanced Training Features 2026-02-20]
-    accumulation_steps = 2          # 梯度累积步长 (在 batch_size=16 时，实际更新等效为 64)
-    gae_lambda = 0.95               # GAE 优势函数的衰减因子 (0~1 之间，越小方差越小、偏差越大)
+    accumulation_steps = 128       # [防过拟合核心机制] 在内存中聚集高达 16*128=2048 步全局经验后才做 1 次 PPO Update！严防过快更新导致跌入“死磕前几个节点”的局部最优！
+    gae_lambda = 0.98               # GAE 优势函数的衰减因子 (适配 3000 极长序列，将长期优势传导给前置任务)
     use_muon = True                 # 是否使用 Muon 优化器进行 2D 张量的更新
     # [SGDR Learning Rate Schedule]
-    sgdr_t0 = 40                    # Cosine Annealing 热重启周期 (建议在多节点大图中延长此至 100+)
+    sgdr_t0 = 150                   # 针对多节点大图大幅延长重启周期 (150 ep 一个深空潜航)
     
     # [Training Control Parameters 2026-02-12]
-    max_episodes = 200             # 最大训练 Episode 数
+    max_episodes = 3000             # 探索万亿级组合的三千大劫
     update_every_episodes = 2       # 多少个 Episode 收集一次数据进行 PPO 更新
     eval_freq = 2                  # 多少个 Episode 进行一次评估
     eval_temperature = 0.0         # 评估/推理时的采样温度 (0.0 表示确定的 Argmax 贪婪策略)

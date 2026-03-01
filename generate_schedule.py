@@ -22,9 +22,9 @@ def find_latest_checkpoint(model_dir):
 def generate_schedule(model_path=None):
     print("--- Generating Schedule (Deterministic) ---")
     
-    # Init Env
-    env = AirLineEnv_Graph(data_path=configs.DATASET_PATH) # Use config default
-    print(f"Dataset: {configs.DATASET_PATH}")
+    data_path = getattr(configs, 'data_file_path', '100.csv')
+    env = AirLineEnv_Graph(data_path=data_path)
+    print(f"Dataset: {data_path}")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -65,13 +65,14 @@ def generate_schedule(model_path=None):
         # Mask
         task_mask, station_mask, worker_mask = env.get_masks()
         
-        # Action
+        # Action (Strictly Greedy for Final Output)
         action, _, _, _ = agent.select_action(
             state.to(device),
             mask_task=task_mask.to(device),
             mask_station_matrix=station_mask.to(device),
             mask_worker=worker_mask.to(device),
-            deterministic=True
+            deterministic=True,
+            temperature=0.0
         )
         
         state, reward, done, info = env.step(action)
@@ -80,7 +81,7 @@ def generate_schedule(model_path=None):
             print(f"Error during generation: {info['error']}")
             break
         
-    print("--- Rollout Complete ---")
+    print(f"--- Rollout Complete. Total Reward: {total_reward:.2f} ---")
     
     # 运行完毕，从环境中直接抽取真实的历史记录
     schedule_log = []

@@ -249,30 +249,30 @@ def train(args):
                     break
             
             # 记录日志
-            writer.add_scalar('Reward/Episode', ep_reward, i_episode)
-            print(f"Episode {i_episode} | Reward: {ep_reward:.2f} | Steps: {t+1}")
+            writer.add_scalar('Reward/Episode', ep_reward, ep)
+            print(f"Episode {ep} | Reward: {ep_reward:.2f} | Steps: {t+1}")
             
             # PPO 更新
-            if i_episode % update_every_episodes == 0:
+            if ep % update_every_episodes == 0:
                 metrics = agent.update(memory, env)
                 memory.clear()
                 
                 for k, v in metrics.items():
-                    writer.add_scalar(k, v, i_episode)
+                    writer.add_scalar(k, v, ep)
                 
             # 定期评估与保存
-            if i_episode % eval_freq == 0:
+            if ep % eval_freq == 0:
                 # 在训练过程中，使用较少的多轮评估 (如 3 轮)，带有极小温度 (如 0.0) 以检测绝对贪婪上线
                 makespan, balance, eval_reward = evaluate_model(env, agent, num_runs=3, temperature=configs.eval_temperature)
                 
-                print(f"[Eval] Ep {i_episode} | Avg Makespan: {makespan:.1f} | Avg Balance: {balance:.2f} | AvgReward: {eval_reward:.2f}")
+                print(f"[Eval] Ep {ep} | Avg Makespan: {makespan:.1f} | Avg Balance: {balance:.2f} | AvgReward: {eval_reward:.2f}")
                 
-                writer.add_scalar('Eval/Makespan', makespan, i_episode)
-                writer.add_scalar('Eval/Balance_Std', balance, i_episode)
+                writer.add_scalar('Eval/Makespan', makespan, ep)
+                writer.add_scalar('Eval/Balance_Std', balance, ep)
                 
                 # Save Latest
                 torch.save({
-                    'episode': i_episode,
+                    'episode': ep,
                     'model_state_dict': agent.policy.state_dict(),
                     'optimizer_state_dict': agent.optimizer.state_dict(),
                 }, checkpoint_path)
