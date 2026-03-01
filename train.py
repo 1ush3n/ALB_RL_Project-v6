@@ -63,7 +63,8 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
     rewards = []
     
     for _ in range(num_runs):
-        state = env.reset()
+        # 验证场景绝对不可以使用任何数据扰乱！保证评估基线的绝对公平。
+        state = env.reset(randomize_duration=False)
         done = False
         total_reward = 0
         device = agent.device
@@ -175,8 +176,13 @@ def train(args):
         
         print(f"开始 Episode 循环 (Max: {max_episodes})...")
         
-        for i_episode in range(start_episode, max_episodes+1):
-            state = env.reset()
+        for ep in range(start_episode, configs.max_episodes + 1):
+            
+            # [Domain Randomization] 如果配置开启泛化性抗干扰，则给环境施加动态工时噪音
+            apply_noise = getattr(configs, 'randomize_durations', False)
+            state = env.reset(randomize_duration=apply_noise)
+            
+            done = False
             ep_reward = 0
             
             # 动态设置最大步数 (防止无限循环，通常设为任务数的2倍)

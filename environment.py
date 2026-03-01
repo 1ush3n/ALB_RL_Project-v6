@@ -232,7 +232,9 @@ class AirLineEnv_Graph(gym.Env):
         
         # 预先分配静态底座张量，避免 step 过程中不断进行内存申请
         self.base_task_x = torch.zeros((self.num_tasks, 17))
-        self.base_task_x[:, 0:1] = dur / 100.0
+        # [Domain Randomization] 备份只读的基础工时分布，用于后续加噪
+        self.base_durations = dur.clone() / 100.0  
+        self.base_task_x[:, 0:1] = self.base_durations
         
         type_onehot = torch.zeros((self.num_tasks, 10))
         type_indices = skill.long().clamp(0, 9)
@@ -243,9 +245,10 @@ class AirLineEnv_Graph(gym.Env):
         self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 1))], dim=1)
         self.base_station_x = torch.zeros((self.num_stations, 8))
         
-    def reset(self):
+    def reset(self, randomize_duration=False):
         """
         重置环境状态以开始新的 Episode。
+        如果在训练阶段开启 randomize_duration，则按 ±range 对静态工时进行伪装修改。
         """
         self.current_time = 0.0
         self.task_status.fill(0) 
@@ -289,6 +292,21 @@ class AirLineEnv_Graph(gym.Env):
         # 克隆 Observation 数据
         self.obs_data = self.base_data.clone()
         
+        # [Domain Randomization] 动态篡改工时
+        if randomize_duration:
+            rnd_range = getattr(configs, 'dur_random_range', 0.2)
+            noise = torch.ones_like(self.base_durations).uniform_(1.0 - rnd_range, 1.0 + rnd_range)
+            perturbed_durations = self.base_durations * noise
+            
+            # 刷新模型底层观测到的图静态信息区 (Task_x[0])
+            self.base_task_x[:, 0:1] = perturbed_durations
+            # 刷新用于仿真计算真实验收时间 (Step duration calculation)
+            self.task_static_feat[:, 0] = (perturbed_durations * 100.0).squeeze()
+        else:
+            # 安全还原成纯净考题卷子
+            self.base_task_x[:, 0:1] = self.base_durations
+            self.task_static_feat[:, 0] = (self.base_durations * 100.0).squeeze()
+            
         # [关键路径计算 (CPM)]
         # 用于后续计算 Blocking Penalty
         self.is_critical = self._calculate_cpm()

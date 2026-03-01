@@ -28,6 +28,12 @@ class configs:
     station_feat_dim = 8            # Station Node Input Features [Load(1), NumTasks(1), Padding(6)]
     
     # ------------------
+    # 泛化性与域随机化 (Domain Randomization)
+    # ------------------
+    randomize_durations = True      # 是否在训练期间开启工时随机扰动
+    dur_random_range = 0.2          # 工时扰动幅度 (0.2 表示基础工时的 ±20% 波动)
+    
+    # ------------------
     # PPO 训练超参数 (PPO Training)
     # ------------------
     lr = 1e-4                       # 初始学习率 (Learning Rate)
