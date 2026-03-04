@@ -191,7 +191,28 @@ class PPOAgent:
             worker_locks = torch.argmax(worker_feats[:, 12:20], dim=1)
             lock_mask = (worker_locks != 0) & (worker_locks != s_act)
             
-            current_worker_mask = current_worker_mask | skill_mask.to(self.device) | lock_mask.to(self.device)
+            # [Hybrid Masking] 2. 稀缺技能保护掩码 (Skill Preservation Mask)
+            preservation_mask = torch.zeros(obs['worker'].num_nodes, dtype=torch.bool).to(self.device)
+            unlocked_mask = (worker_locks == 0)
+            
+            for k in range(10):
+                if k == task_type_idx: continue
+                # 散人中懂得技能 k 的总人数
+                workers_with_k = worker_skills[:, k] > 0.5
+                free_experts_k = (workers_with_k & unlocked_mask).sum().item()
+                # 如果散人库里的 k 专家 <= 2 人 (即独苗濒危)
+                if free_experts_k <= 2:
+                    # 强行保护：如果你懂这门频危手艺但当前任务却不需要这门手艺，那你不能参加！
+                    is_valuable_expert = workers_with_k & unlocked_mask 
+                    preservation_mask = preservation_mask | is_valuable_expert.to(self.device)
+            
+            # 试算：应用保护掩码后是否还有足够人手满足 demand
+            trial_mask = current_worker_mask | skill_mask.to(self.device) | lock_mask.to(self.device) | preservation_mask
+            if (~trial_mask).sum().item() >= demand:
+                current_worker_mask = trial_mask # 启用独苗保护
+            else:
+                # 活儿干不完了，动用战略储备
+                current_worker_mask = current_worker_mask | skill_mask.to(self.device) | lock_mask.to(self.device)
             
             worker_embs = x_dict['worker'].unsqueeze(0)
             

@@ -61,6 +61,7 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
     makespans = []
     balances = []
     rewards = []
+    schedules = []
     
     for _ in range(num_runs):
         # 验证场景绝对不可以使用任何数据扰乱！保证评估基线的绝对公平。
@@ -94,12 +95,15 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
             makespans.append(99999.0) # Matches GA's massive penalty
             balances.append(9999.0)
             rewards.append(total_reward - 10000.0)
+            schedules.append([])
         else:
             makespans.append(np.max(env.station_loads))
             balances.append(np.std(env.station_loads))
             rewards.append(total_reward)
+            schedules.append(env.assigned_tasks)
         
-    return np.mean(makespans), np.mean(balances), np.mean(rewards)
+    best_idx = np.argmin(makespans)
+    return np.mean(makespans), np.mean(balances), np.mean(rewards), schedules[best_idx]
 
 # ---------------------------------------------------------------------------
 # 训练主循环
@@ -190,7 +194,7 @@ def train(args):
             
             # [Domain Randomization] 如果配置开启泛化性抗干扰，则给环境施加动态工时噪音
             apply_noise = getattr(configs, 'randomize_durations', False)
-            state = env.reset(randomize_duration=apply_noise)
+            state = env.reset(randomize_duration=apply_noise, randomize_workers=apply_noise)
             
             done = False
             ep_reward = 0
@@ -274,7 +278,7 @@ def train(args):
             # 定期评估与保存
             if ep % eval_freq == 0:
                 # 在训练过程中，使用较少的多轮评估 (如 3 轮)，带有极小温度 (如 0.0) 以检测绝对贪婪上线
-                makespan, balance, eval_reward = evaluate_model(env, agent, num_runs=3, temperature=configs.eval_temperature)
+                makespan, balance, eval_reward, best_sch = evaluate_model(env, agent, num_runs=3, temperature=configs.eval_temperature)
                 
                 print(f"[Eval] Ep {ep} | Avg Makespan: {makespan:.1f} | Avg Balance: {balance:.2f} | AvgReward: {eval_reward:.2f}")
                 
@@ -293,6 +297,26 @@ def train(args):
                     best_makespan = makespan
                     torch.save(agent.policy.state_dict(), best_model_path)
                     print(f"New Best Model Saved! Makespan: {best_makespan}")
+                    
+                    # [Real-time Tracer] 实时快照抓拍最好成绩的排单策略
+                    trace_dir = "results/eval_traces"
+                    os.makedirs(trace_dir, exist_ok=True)
+                    if best_sch:
+                        tasks_data = []
+                        for (tid, sid, team, start, end) in best_sch:
+                             tasks_data.append({
+                                 'TaskID': tid,
+                                 'StationID': sid + 1,
+                                 'Team': str(team),
+                                 'Start': start,
+                                 'End': end,
+                                 'Duration': end - start
+                             })
+                        df = pd.DataFrame(tasks_data)
+                        df.to_csv(os.path.join(trace_dir, f"Ep_{ep}_Best_Schedule.csv"), index=False)
+                        plot_gantt(best_sch, os.path.join(trace_dir, f"Ep_{ep}_Gantt.png"))
+                        print(f"📸 Real-time Schedule Trace exported to {trace_dir}/Ep_{ep}_Gantt.png")
+                        
                     
         # =======================================================================
         # 6. 训练结束 - 终局性能测评与基线对比 (End of Training Evaluation)
@@ -313,10 +337,7 @@ def train(args):
         print("\n>>> [1/2] 开始执行 PPO Agent 的终局推演...")
         # 重新实例环境，避免脏数据
         eval_env = AirLineEnv_Graph(data_path=data_path, seed=2026)
-        ppo_makespan, ppo_balance, _ = evaluate_model(eval_env, agent, num_runs=5, temperature=configs.eval_temperature)
-        
-        # 提取最后的分配单
-        ppo_assigned = eval_env.assigned_tasks 
+        ppo_makespan, ppo_balance, _, ppo_assigned = evaluate_model(eval_env, agent, num_runs=5, temperature=configs.eval_temperature)
         
         # 配置 GA 基准对抗
         print("\n>>> [2/2] 开始执行 Genetic Algorithm (GA) 基线推演...")

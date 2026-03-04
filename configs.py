@@ -4,15 +4,20 @@ class configs:
     # 路径配置 (Paths)
     # ------------------
     # 默认数据路径 (如果没有通过命令行参数指定)
-    data_file_path = "100.csv" 
+    data_dir = "data"
+    data_file_path = "data/100.csv" 
+    worker_pool_path = "data/worker_pool_fixed.csv"
     
     # ------------------
     # 环境与图相关 (Environment & Graph)
     # ------------------
-    n_j = 715                     # 任务(工序)数量估计 (Graph Nodes)
-    n_m = 3                        # 站位数量 (Stations)
-    n_w = 90                        # 工人数量 (Workers)
+    n_j = 715                       # 任务(工序)数量估计 (Graph Nodes)
+    n_m = 3                         # 站位数量 (Stations)
+    n_w_max = 100                   # 工人池总上限 (最大可配置的工人数量，固定池容量)
+    n_w_min = 30                    # 每回合训练随机抽取的最小工人数 (Domain Randomization)
+    n_w = 90                        # 每回合训练抽取的最大工人数，及验证(Eval)阶段固定的工人数
                                     # 注意：实际任务数由 data_loader 动态加载，此处仅作参考或 Embedding 初始化上界
+    max_station_capacity_ratio = 0.6  # [Hybrid Masking] 单个站位最大容许绑定全厂总人数的比例，超过此值则站位被强制 Mask 屏蔽
     
     # ------------------
     # 模型超参数 (Model Hyperparameters)

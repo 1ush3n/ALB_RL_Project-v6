@@ -131,60 +131,28 @@ class AirLineEnv_Graph(gym.Env):
         # ------------------
         # 2. 工人节点 (Worker Nodes)
         # ------------------
-        # 效率系数: 在 [0.8, 1.2] 之间均匀分布
-        self.worker_efficiency = np.random.uniform(0.8, 1.2, self.num_workers)
-        self.worker_static_feat = torch.tensor(self.worker_efficiency, dtype=torch.float).unsqueeze(1)
+        # Load full worker pool
+        pool_path = getattr(configs, 'worker_pool_path', 'data/worker_pool_fixed.csv')
+        if not os.path.exists(pool_path):
+             pool_path = os.path.join(os.getcwd(), pool_path)
+             
+        full_worker_df = pd.read_csv(pool_path)
+        self.n_w_max = len(full_worker_df)
+        self.full_worker_efficiency = full_worker_df['efficiency'].values
+        self.full_worker_skill_matrix = torch.tensor(
+            full_worker_df[[f'skill_{i}' for i in range(10)]].values, 
+            dtype=torch.float
+        )
         
-        # 技能矩阵: [NumWorkers, 10] (假设最多10种技能类型)
-        self.worker_skill_matrix = torch.zeros((self.num_workers, 10), dtype=torch.float)
+        # Default workers (used in eval)
+        self.num_workers = getattr(configs, 'n_w', 90)
         
-        # [鲁棒性与可行性保证]
+        # Initialize default sizes just to keep base shapes valid before first reset
+        self.worker_efficiency = self.full_worker_efficiency[:self.num_workers]
+        self.worker_skill_matrix = self.full_worker_skill_matrix[:self.num_workers]
         # 计算每种技能的最大需求人数，确保每种技能至少有这么多工人拥有，
         # 防止出现 "任务需要5人，但全场只有3个合格工人" 的死锁情况。
-        max_demand = demand.max().item()
-        min_workers_per_skill = int(max(1, max_demand))
-        
-        # A. 保证覆盖率 (Guarantee Coverage)
-        for s_idx in range(10):
-            current_count = self.worker_skill_matrix[:, s_idx].sum()
-            while current_count < min_workers_per_skill:
-                # 随机挑选一个还没有该技能的工人
-                choices = torch.where(self.worker_skill_matrix[:, s_idx] == 0)[0].numpy()
-                if len(choices) == 0: break # 所有人都已经有了
-                w_idx = np.random.choice(choices)
-                self.worker_skill_matrix[w_idx, s_idx] = 1.0
-                current_count += 1
-            
-        # B. 随机分配剩余技能 (Random Assignment)
-        # 每个工人额外随机获得 1-2 个技能
-        for w in range(self.num_workers):
-            current_skills = self.worker_skill_matrix[w].sum()
-            target_skills = np.random.randint(1, 4) # 目标总技能数
-            
-            if current_skills < target_skills:
-                num_to_add = int(target_skills - current_skills)
-                choices = torch.where(self.worker_skill_matrix[w] == 0)[0].numpy()
-                if len(choices) > 0:
-                    selected_skills = np.random.choice(choices, size=min(num_to_add, len(choices)), replace=False)
-                    self.worker_skill_matrix[w, selected_skills] = 1.0
-        
-        # ------------------
-        # 3. 静态边 (Static Edges)
-        # ------------------
-        # Task -> Task (工艺优先关系)
-        data['task', 'precedes', 'task'].edge_index = self.raw_data['precedence_edges']
-        
-        # [显存优化] 将 Worker -> Task 的图连接从强依赖的全连接 O(W*T) 转换为极度稀疏的真实技能匹配连接
-        # 此举能够把前向传播 GATv2Conv 的 660,000 级边缩减 80% 到 90%，从物理层面消除 9GB 级别的显存 OOM 和计算冗余！
-        w_indices = torch.arange(self.num_workers).repeat_interleave(self.num_tasks)
-        t_indices = torch.arange(self.num_tasks).repeat(self.num_workers)
-        task_req_skills = skill.squeeze(1).long() # [num_tasks]
-        
-        # 批量检测对应工人是否真正拥有目前任务列举出的技能点
-        has_skill_mask = self.worker_skill_matrix[w_indices, task_req_skills[t_indices]] == 1.0
-        
-        # 仅为有效节点保留连接
-        data['worker', 'can_do', 'task'].edge_index = torch.stack([w_indices[has_skill_mask], t_indices[has_skill_mask]])
+        self.worker_static_feat = torch.tensor(self.worker_efficiency, dtype=torch.float).unsqueeze(1)
         
         # [再次鲁棒性检查] Check and Clamp Demand
         # 双重保险：如果初始化后发现某技能工人总数仍少于某任务需求，强制降低该任务需求。
@@ -247,15 +215,53 @@ class AirLineEnv_Graph(gym.Env):
         self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 9))], dim=1)
         self.base_station_x = torch.zeros((self.num_stations, 12))
         
-    def reset(self, randomize_duration=False):
+    def reset(self, randomize_duration=False, randomize_workers=False):
         """
         重置环境状态以开始新的 Episode。
         如果在训练阶段开启 randomize_duration，则按 ±range 对静态工时进行伪装修改。
+        如果在训练阶段开启 randomize_workers，则动态随机抽取固定工人池的一个子集（领域随机化）。
         """
+        # ====================
+        # [Domain Randomization] Worker Pool Sampling
+        # ====================
+        if randomize_workers:
+            min_w = getattr(configs, 'n_w_min', 30)
+            max_w = getattr(configs, 'n_w', 90)
+            self.num_workers = np.random.randint(min_w, max_w + 1)
+            
+            # 保障覆盖率的抽样：确保所有必要的技能都有人会
+            req_skills = self.task_static_feat[:, 1].unique().long().numpy()
+            selected = set()
+            for req in req_skills:
+                capable_workers = np.where(self.full_worker_skill_matrix[:, req] == 1)[0]
+                if len(capable_workers) > 0:
+                    selected.add(np.random.choice(capable_workers))
+            
+            remaining = list(set(range(self.n_w_max)) - selected)
+            num_to_add = self.num_workers - len(selected)
+            if num_to_add > 0:
+                selected.update(np.random.choice(remaining, num_to_add, replace=False))
+            else:
+                self.num_workers = len(selected)
+                
+            w_indices = np.array(list(selected))
+            np.random.shuffle(w_indices)
+        else:
+            self.num_workers = getattr(configs, 'n_w', 90)
+            w_indices = np.arange(self.num_workers)
+            
+        self.worker_efficiency = self.full_worker_efficiency[w_indices]
+        self.worker_skill_matrix = self.full_worker_skill_matrix[w_indices]
+        self.worker_static_feat = torch.tensor(self.worker_efficiency, dtype=torch.float).unsqueeze(1)
+        
+        # 重建动态的 base_worker_x (维度随 num_workers 变化)
+        self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 9))], dim=1)
+        
+        # 重置运行状态张量
         self.current_time = 0.0
         self.task_status.fill(0) 
-        self.worker_free_time.fill(0.0)
-        self.worker_locks.fill(0) # 重置工人站位绑定锁
+        self.worker_free_time = np.zeros(self.num_workers, dtype=float)
+        self.worker_locks = np.zeros(self.num_workers, dtype=int)
         self.station_loads.fill(0.0)
         self.event_queue = []
         
@@ -292,8 +298,15 @@ class AirLineEnv_Graph(gym.Env):
             else:
                 self.task_status[i] = 0 # Not Ready
                 
-        # 克隆 Observation 数据
+        # 克隆 Observation 数据并重建稀疏边矩阵 (由于 worker数量波动)
         self.obs_data = self.base_data.clone()
+        
+        w_indices_edge = torch.arange(self.num_workers).repeat_interleave(self.num_tasks)
+        t_indices_edge = torch.arange(self.num_tasks).repeat(self.num_workers)
+        task_req_skills = self.task_static_feat[:, 1].squeeze().long()
+        has_skill_mask = self.worker_skill_matrix[w_indices_edge, task_req_skills[t_indices_edge]] == 1.0
+        
+        self.obs_data['worker', 'can_do', 'task'].edge_index = torch.stack([w_indices_edge[has_skill_mask], t_indices_edge[has_skill_mask]])
         
         # [Domain Randomization] 动态篡改工时
         if randomize_duration:
@@ -521,10 +534,10 @@ class AirLineEnv_Graph(gym.Env):
         # E. 终局奖励 (Final Reward)
         done = (len(self.assigned_tasks) == self.num_tasks)
         if done:
-            # 站位平衡惩罚 (Balance Penalty)
-            # [Reward Tuning] 权重从 1.0 降为 0.1，避免喧宾夺主 (当前系数0.5)
+            # [Hybrid Masking & Shaping] 站位平衡惩罚 (Balance Penalty)
+            # 秋后算账：前期不管，但完工结算时如果各个站位总耗时极不均衡，给予巨大的非线性惩罚 (原本0.5 -> 增加到2.0或更大)
             st_std = np.std(self.station_loads)
-            reward -= 0.5 * st_std 
+            reward -= 2.5 * st_std 
         
         return self._get_observation(), reward, done, {}
 
@@ -648,8 +661,18 @@ class AirLineEnv_Graph(gym.Env):
             # 构建该任务合法的备选站位域
             station_range = [fixed] if fixed != -1 else list(range(min_station, min(self.num_stations, max_station + 1)))
             
+            # [Hybrid Masking] 1. 站位容量硬限制 (Station Capacity Limit)
+            max_cap_ratio = getattr(configs, 'max_station_capacity_ratio', 0.6)
+            capacity_limit = int(self.num_workers * max_cap_ratio)
+            
             for s in station_range:
                 if s < 0 or s >= self.num_stations: continue
+                
+                # 检查该站位是否已经爆满
+                current_bound = np.sum(self.worker_locks == s + 1)
+                if current_bound >= capacity_limit:
+                    continue # 爆满，物理屏蔽该站位，强迫推往下游
+                
                 # 检查能够支持在这个站位s工作的空闲人员：即 未绑定(0) 或 已经绑定到(s+1) 的人，并且拥有 req_skill
                 compatible_lock = (free_locks == 0) | (free_locks == s + 1)
                 has_skill = free_skills[:, req_skill] > 0.5
@@ -744,7 +767,9 @@ class AirLineEnv_Graph(gym.Env):
             'edge_ts_cnt': self.edge_ts_cnt,
             'edge_tw_cnt': self.edge_tw_cnt,
             'edge_ts_mem': self.edge_ts_mem[:, :self.edge_ts_cnt].clone() if self.edge_ts_cnt > 0 else torch.empty((2,0), dtype=torch.long),
-            'edge_tw_mem': self.edge_tw_mem[:, :self.edge_tw_cnt].clone() if self.edge_tw_cnt > 0 else torch.empty((2,0), dtype=torch.long)
+            'edge_tw_mem': self.edge_tw_mem[:, :self.edge_tw_cnt].clone() if self.edge_tw_cnt > 0 else torch.empty((2,0), dtype=torch.long),
+            'base_worker_x': self.base_worker_x.clone(),
+            'can_do_edge_index': self.obs_data['worker', 'can_do', 'task'].edge_index.clone()
         }
         
     def rebuild_state_from_snapshot(self, snapshot):
@@ -758,34 +783,36 @@ class AirLineEnv_Graph(gym.Env):
         task_x[torch.arange(self.num_tasks), snapshot['task_status'] + 1] = 1.0
         data['task'].x = task_x
         
-        worker_x = self.base_worker_x.clone()
+        snap_num_workers = len(snapshot['worker_free_time'])
+        worker_x = snapshot['base_worker_x'].clone()
         is_free_bool = (snapshot['worker_free_time'] <= snapshot['current_time'])
         worker_x[:, 11] = torch.tensor(is_free_bool, dtype=torch.float)
         
         worker_x[:, 12:20] = 0.0
         snap_locks = snapshot['worker_locks']
         lock_indices = torch.tensor(snap_locks, dtype=torch.long).clamp(max=7)
-        worker_x[torch.arange(self.num_workers), 12 + lock_indices] = 1.0
+        worker_x[torch.arange(snap_num_workers), 12 + lock_indices] = 1.0
         
         data['worker'].x = worker_x
+        data['worker', 'can_do', 'task'].edge_index = snapshot['can_do_edge_index'].clone()
         
         station_x = self.base_station_x.clone()
         station_x[:, 0] = torch.tensor(snapshot['station_loads'], dtype=torch.float) / 1000.0
         
         global_mobile_count = np.sum(snap_locks == 0)
-        station_x[:, 2] = float(global_mobile_count) / self.num_workers
+        station_x[:, 2] = float(global_mobile_count) / snap_num_workers
         
         for s in range(self.num_stations):
             bound_count = np.sum(snap_locks == s + 1)
-            station_x[s, 1] = float(bound_count) / self.num_workers
+            station_x[s, 1] = float(bound_count) / snap_num_workers
             
             free_and_bound = np.sum((snap_locks == s + 1) & is_free_bool)
-            station_x[s, 3] = float(free_and_bound) / self.num_workers
+            station_x[s, 3] = float(free_and_bound) / snap_num_workers
             
         data['station'].x = station_x
         
         if snapshot['edge_ts_cnt'] > 0:
-            t_s_edge = snapshot['edge_ts_mem']
+            t_s_edge = snapshot['edge_ts_mem'].clone()
             s_t_edge = torch.stack([t_s_edge[1], t_s_edge[0]], dim=0)
         else:
             t_s_edge = torch.empty((2, 0), dtype=torch.long)
@@ -793,6 +820,12 @@ class AirLineEnv_Graph(gym.Env):
             
         data['task', 'assigned_to', 'station'].edge_index = t_s_edge
         data['station', 'has_task', 'task'].edge_index = s_t_edge
-        data['task', 'done_by', 'worker'].edge_index = snapshot['edge_tw_mem']
+        
+        if snapshot['edge_tw_cnt'] > 0:
+             t_w_edge = snapshot['edge_tw_mem'].clone()
+        else:
+             t_w_edge = torch.empty((2, 0), dtype=torch.long)
+             
+        data['task', 'done_by', 'worker'].edge_index = t_w_edge
         
         return data
