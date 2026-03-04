@@ -110,7 +110,7 @@ class GeneticAlgorithmScheduler:
             # Deadlock 保护
             if t_mask.all():
                 # 遭受锁死的染色体给予极其恶劣的惩罚
-                return 999999.0, 9999.0
+                return 999999.0, (99999.0, 9999.0, [])
             
             # 1. 在当前可做任务中，挑剔出 priority_map 最高的那个
             available_tasks = [i for i in range(self.num_tasks) if not t_mask[i].item()]

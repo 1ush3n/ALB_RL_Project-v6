@@ -10,8 +10,8 @@ class configs:
     # 环境与图相关 (Environment & Graph)
     # ------------------
     n_j = 715                     # 任务(工序)数量估计 (Graph Nodes)
-    n_m = 5                        # 站位数量 (Stations)
-    n_w = 60                        # 工人数量 (Workers)
+    n_m = 3                        # 站位数量 (Stations)
+    n_w = 90                        # 工人数量 (Workers)
                                     # 注意：实际任务数由 data_loader 动态加载，此处仅作参考或 Embedding 初始化上界
     
     # ------------------

@@ -72,6 +72,11 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
         while not done:
             task_mask, station_mask, worker_mask = env.get_masks()
             
+            if task_mask.all():
+                # [Fix]: Prevent infinite lengths caused by picking blank tasks during a deadlock. 
+                print(f"[Eval] DEADLOCK detected! Returning max penalty.")
+                break
+                
             # 引入验证温度的动作选择
             action, _, _, _ = agent.select_action(
                 state.to(device), 
@@ -85,9 +90,14 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
             state, reward, done, _ = env.step(action)
             total_reward += reward
             
-        makespans.append(np.max(env.station_loads))
-        balances.append(np.std(env.station_loads))
-        rewards.append(total_reward)
+        if task_mask.all():
+            makespans.append(99999.0) # Matches GA's massive penalty
+            balances.append(9999.0)
+            rewards.append(total_reward - 10000.0)
+        else:
+            makespans.append(np.max(env.station_loads))
+            balances.append(np.std(env.station_loads))
+            rewards.append(total_reward)
         
     return np.mean(makespans), np.mean(balances), np.mean(rewards)
 
@@ -202,7 +212,8 @@ def train(args):
                 # 死锁检测 (Deadlock Check)
                 if t_mask.all():
                      print(f"DEADLOCK (Step {t}): 无可行任务。")
-                     reward = -1000.0 
+                     # [Fix]: massive penalty (-10000.0) so it never prefers "suicide over working"
+                     reward = -10000.0 
                      done = True
                      # 记录这一步以供学习 (改为轻量级 Snapshot)
                      memory.states.append(env.get_state_snapshot())

@@ -619,11 +619,14 @@ class AirLineEnv_Graph(gym.Env):
         
         ready_indices = np.where(self.task_status == 1)[0]
         
-        # 使用向量化计算获取空闲技能可用量
-        if (~worker_mask_np).any():
-            avail_skills = self.worker_skill_matrix[~worker_mask_np].sum(dim=0).numpy()
+        # 使用向量化计算获取空闲技能与锁定状态可用量
+        free_workers_idx = np.where(~worker_mask_np)[0]
+        if len(free_workers_idx) > 0:
+            free_skills = self.worker_skill_matrix[free_workers_idx].numpy() # [NumFree, 10]
+            free_locks = self.worker_locks[free_workers_idx] # [NumFree]
         else:
-            avail_skills = np.zeros(10)
+            free_skills = np.zeros((0, 10))
+            free_locks = np.zeros(0)
                  
         for t in ready_indices:
             # A. 站位约束
@@ -635,28 +638,30 @@ class AirLineEnv_Graph(gym.Env):
             
             fixed = self.fixed_stations[t]
             
-            # B. 资源约束
+            # B. 资源约束与站位可行性检查
             req_skill = int(self.task_static_feat[t, 1].item())
             req_demand = int(self.task_static_feat[t, 2].item())
             
-            avail = avail_skills[req_skill]
+            valid_stations = False
+            max_station = self.max_allowed_stations[t]
             
-            if avail >= req_demand:
-                # 资源充足，检查站位
-                valid_stations = False
-                max_station = self.max_allowed_stations[t]
-                if fixed != -1:
-                    if min_station <= fixed <= max_station:
-                        station_mask[t, fixed] = False
-                        valid_stations = True
-                else:
-                    if min_station < self.num_stations and min_station <= max_station:
-                        end_station = min(self.num_stations, max_station + 1)
-                        station_mask[t, min_station:end_station] = False
-                        valid_stations = True
-                        
-                if valid_stations:
-                    task_mask[t] = False # Valid
+            # 构建该任务合法的备选站位域
+            station_range = [fixed] if fixed != -1 else list(range(min_station, min(self.num_stations, max_station + 1)))
+            
+            for s in station_range:
+                if s < 0 or s >= self.num_stations: continue
+                # 检查能够支持在这个站位s工作的空闲人员：即 未绑定(0) 或 已经绑定到(s+1) 的人，并且拥有 req_skill
+                compatible_lock = (free_locks == 0) | (free_locks == s + 1)
+                has_skill = free_skills[:, req_skill] > 0.5
+                avail = np.sum(compatible_lock & has_skill)
+                
+                if avail >= req_demand:
+                    # 只有当这个特定的站位能凑齐人数时，该站位对该任务才是合法的！
+                    station_mask[t, s] = False
+                    valid_stations = True
+                    
+            if valid_stations:
+                task_mask[t] = False # 如果有至少一个合法的站位能开工，该任务才被视为 Valid
                     
         return task_mask, station_mask, worker_mask
 
