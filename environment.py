@@ -244,8 +244,8 @@ class AirLineEnv_Graph(gym.Env):
         self.base_task_x[:, 5:15] = type_onehot
         self.base_task_x[:, 16:17] = demand
         
-        self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 2))], dim=1)
-        self.base_station_x = torch.zeros((self.num_stations, 8))
+        self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 9))], dim=1)
+        self.base_station_x = torch.zeros((self.num_stations, 12))
         
     def reset(self, randomize_duration=False):
         """
@@ -683,12 +683,33 @@ class AirLineEnv_Graph(gym.Env):
         worker_x = self.base_worker_x.clone()
         is_free_bool = (self.worker_free_time <= self.current_time)
         worker_x[:, 11] = torch.tensor(is_free_bool, dtype=torch.float)
-        worker_x[:, 12] = torch.tensor(self.worker_locks, dtype=torch.float)
+        
+        # [Feature Upgrade] One-Hot Encode Lock state (Lock=0 means 12, Lock=1 means 13...)
+        worker_x[:, 12:20] = 0.0 # Clear
+        lock_indices = torch.tensor(self.worker_locks, dtype=torch.long)
+        # Cap index at 7 safely to prevent out-of-bounds if dynamic stations exceed 7
+        lock_indices = torch.clamp(lock_indices, max=7) 
+        worker_x[torch.arange(self.num_workers), 12 + lock_indices] = 1.0
+        
         data['worker'].x = worker_x
         
         # 3. Station Features (In-place refresh)
         station_x = self.base_station_x.clone()
         station_x[:, 0] = torch.tensor(self.station_loads, dtype=torch.float) / 1000.0
+        
+        # [Feature Upgrade] Macro Strategic Features for Path Planning
+        global_mobile_count = np.sum(self.worker_locks == 0)
+        station_x[:, 2] = float(global_mobile_count) / self.num_workers
+        
+        for s in range(self.num_stations):
+            # bound workers ratio
+            bound_count = np.sum(self.worker_locks == s + 1)
+            station_x[s, 1] = float(bound_count) / self.num_workers
+            
+            # available stationed workers ratio
+            free_and_bound = np.sum((self.worker_locks == s + 1) & is_free_bool)
+            station_x[s, 3] = float(free_and_bound) / self.num_workers
+            
         data['station'].x = station_x
         
         # 4. Dynamic Edges (Assigned To)
@@ -740,11 +761,27 @@ class AirLineEnv_Graph(gym.Env):
         worker_x = self.base_worker_x.clone()
         is_free_bool = (snapshot['worker_free_time'] <= snapshot['current_time'])
         worker_x[:, 11] = torch.tensor(is_free_bool, dtype=torch.float)
-        worker_x[:, 12] = torch.tensor(snapshot['worker_locks'], dtype=torch.float)
+        
+        worker_x[:, 12:20] = 0.0
+        snap_locks = snapshot['worker_locks']
+        lock_indices = torch.tensor(snap_locks, dtype=torch.long).clamp(max=7)
+        worker_x[torch.arange(self.num_workers), 12 + lock_indices] = 1.0
+        
         data['worker'].x = worker_x
         
         station_x = self.base_station_x.clone()
         station_x[:, 0] = torch.tensor(snapshot['station_loads'], dtype=torch.float) / 1000.0
+        
+        global_mobile_count = np.sum(snap_locks == 0)
+        station_x[:, 2] = float(global_mobile_count) / self.num_workers
+        
+        for s in range(self.num_stations):
+            bound_count = np.sum(snap_locks == s + 1)
+            station_x[s, 1] = float(bound_count) / self.num_workers
+            
+            free_and_bound = np.sum((snap_locks == s + 1) & is_free_bool)
+            station_x[s, 3] = float(free_and_bound) / self.num_workers
+            
         data['station'].x = station_x
         
         if snapshot['edge_ts_cnt'] > 0:

@@ -124,9 +124,9 @@ class GeneticAlgorithmScheduler:
             # 2. 定站位
             # 若配置的站位非法(mask=True)，则强制分配给当前合法的、序号最小的站位
             desired_station = stations[best_task_id]
-            if s_mask[best_task_id, desired_station]:
+            if s_mask[best_task_id, desired_station].item():
                 # 找一个合法的站位 (容错)
-                valid_stations = [s for s in range(self.num_stations) if not s_mask[best_task_id, s]]
+                valid_stations = [s for s in range(self.num_stations) if not s_mask[best_task_id, s].item()]
                 if not valid_stations:
                     sim_env._advance_time() # 没任何站位空闲，被逼跳过时间
                     continue
@@ -166,8 +166,8 @@ class GeneticAlgorithmScheduler:
             total_makespan = np.max(sim_env.station_loads)
             total_balance_std = np.std(sim_env.station_loads)
             
-        # 以 makespan 为第一适应度 (越小越好)，balance 为次要 (可转化为惩罚项)
-        fitness = total_makespan + 0.1 * total_balance_std 
+        # 以 makespan 为第一适应度 (越小越好)，balance 为次要 (与 RL 环境中的惩罚权重 1:1 绝对对齐)
+        fitness = total_makespan + 1.0 * total_balance_std 
         return fitness, (total_makespan, total_balance_std, sim_env.assigned_tasks)
 
     def _crossover(self, p1, p2):

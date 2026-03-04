@@ -188,7 +188,7 @@ class PPOAgent:
             skill_mask = ~has_skill 
             
             s_act = station_action.item() + 1
-            worker_locks = worker_feats[:, 12]
+            worker_locks = torch.argmax(worker_feats[:, 12:20], dim=1)
             lock_mask = (worker_locks != 0) & (worker_locks != s_act)
             
             current_worker_mask = current_worker_mask | skill_mask.to(self.device) | lock_mask.to(self.device)
@@ -433,7 +433,7 @@ class PPOAgent:
                 skill_mask = (~has_skill_flat).view(B_size, Max_W_size).to(self.device)
                 
                 s_act = batch.y_station + 1 # [B]
-                worker_locks = worker_raw[:, :, 12] # [B, Max_W]
+                worker_locks = torch.argmax(worker_raw[:, :, 12:20], dim=2) # [B, Max_W]
                 s_act_expanded = s_act.view(B_size, 1).expand(B_size, Max_W_size).to(self.device)
                 lock_mask = (worker_locks != 0) & (worker_locks != s_act_expanded)
                 

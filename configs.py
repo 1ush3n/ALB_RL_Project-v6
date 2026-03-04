@@ -24,8 +24,8 @@ class configs:
     
     # 输入特征维度 (根据 environment.py 中的 _get_observation 定义)
     task_feat_dim = 17              # Task Node Input Features [Duration, Status(4), Type(10), Wait(1), Demand(1)]
-    worker_feat_dim = 13            # Worker Node Input Features [Efficiency(1), Skills(10), IsFree(1), Lock(1)]
-    station_feat_dim = 8            # Station Node Input Features [Load(1), NumTasks(1), Padding(6)]
+    worker_feat_dim = 20            # Worker Node Input Features [Efficiency(1), Skills(10), IsFree(1), Lock(8)]
+    station_feat_dim = 12           # Station Node Input Features [Load(1), BoundRatio(1), MobileRatio(1), FreeBoundRatio(1)]
     
     # ------------------
     # 泛化性与域随机化 (Domain Randomization)
