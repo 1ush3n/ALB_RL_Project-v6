@@ -76,6 +76,8 @@ class AirLineEnv_Graph(gym.Env):
         # 任务状态: 0=不可用(Not Ready), 1=就绪(Ready), 2=已调度(Scheduled)
         self.task_status = np.zeros(self.num_tasks, dtype=int) 
         self.worker_free_time = np.zeros(self.num_workers, dtype=float) 
+        # 工人定岗状态: 0=机动人员(未绑定), 1..num_stations=已绑定站位
+        self.worker_locks = np.zeros(self.num_workers, dtype=int)
         self.station_loads = np.zeros(self.num_stations, dtype=float)
         
         # 事件队列 (Priority Queue)
@@ -242,7 +244,7 @@ class AirLineEnv_Graph(gym.Env):
         self.base_task_x[:, 5:15] = type_onehot
         self.base_task_x[:, 16:17] = demand
         
-        self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 1))], dim=1)
+        self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 2))], dim=1)
         self.base_station_x = torch.zeros((self.num_stations, 8))
         
     def reset(self, randomize_duration=False):
@@ -253,6 +255,7 @@ class AirLineEnv_Graph(gym.Env):
         self.current_time = 0.0
         self.task_status.fill(0) 
         self.worker_free_time.fill(0.0)
+        self.worker_locks.fill(0) # 重置工人站位绑定锁
         self.station_loads.fill(0.0)
         self.event_queue = []
         
@@ -439,9 +442,11 @@ class AirLineEnv_Graph(gym.Env):
         start_time = self.current_time
         finish_time = start_time + duration
         
-        # 更新工人状态
+        # 更新工人状态与站位绑定
         for w in team:
             self.worker_free_time[w] = finish_time
+            if self.worker_locks[w] == 0 and station_id != -1:
+                self.worker_locks[w] = station_id + 1
         
         # 更新站位负载 (近似值，用于 Makespan 估算)
         self.station_loads[station_id] += duration 
@@ -673,6 +678,7 @@ class AirLineEnv_Graph(gym.Env):
         worker_x = self.base_worker_x.clone()
         is_free_bool = (self.worker_free_time <= self.current_time)
         worker_x[:, 11] = torch.tensor(is_free_bool, dtype=torch.float)
+        worker_x[:, 12] = torch.tensor(self.worker_locks, dtype=torch.float)
         data['worker'].x = worker_x
         
         # 3. Station Features (In-place refresh)
@@ -706,6 +712,7 @@ class AirLineEnv_Graph(gym.Env):
         return {
             'task_status': self.task_status.copy(),
             'worker_free_time': self.worker_free_time.copy(),
+            'worker_locks': self.worker_locks.copy(),
             'station_loads': self.station_loads.copy(),
             'current_time': self.current_time,
             'edge_ts_cnt': self.edge_ts_cnt,
@@ -728,6 +735,7 @@ class AirLineEnv_Graph(gym.Env):
         worker_x = self.base_worker_x.clone()
         is_free_bool = (snapshot['worker_free_time'] <= snapshot['current_time'])
         worker_x[:, 11] = torch.tensor(is_free_bool, dtype=torch.float)
+        worker_x[:, 12] = torch.tensor(snapshot['worker_locks'], dtype=torch.float)
         data['worker'].x = worker_x
         
         station_x = self.base_station_x.clone()

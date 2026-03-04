@@ -139,11 +139,12 @@ class GeneticAlgorithmScheduler:
             # 从全局掩码过滤可用工人
             available_workers = [w for w in range(self.num_workers) if not w_mask[w].item()]
             
-            # 再过滤：有技能的可用工人
+            # 再过滤：有技能且站位绑定(Lock)不冲突的可用工人
             skilled_available = []
             for w in available_workers:
                 worker_skills = sim_env.worker_skill_matrix[w]
-                if worker_skills[task_type_idx] > 0.5:
+                worker_lock = sim_env.worker_locks[w]
+                if worker_skills[task_type_idx] > 0.5 and (worker_lock == 0 or worker_lock == desired_station + 1):
                     skilled_available.append(w)
             
             if len(skilled_available) < req_demand:

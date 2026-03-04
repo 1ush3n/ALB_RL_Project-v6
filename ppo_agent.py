@@ -187,7 +187,11 @@ class PPOAgent:
             has_skill = worker_skills[:, task_type_idx] > 0.5
             skill_mask = ~has_skill 
             
-            current_worker_mask = current_worker_mask | skill_mask.to(self.device)
+            s_act = station_action.item() + 1
+            worker_locks = worker_feats[:, 12]
+            lock_mask = (worker_locks != 0) & (worker_locks != s_act)
+            
+            current_worker_mask = current_worker_mask | skill_mask.to(self.device) | lock_mask.to(self.device)
             
             worker_embs = x_dict['worker'].unsqueeze(0)
             
@@ -428,7 +432,12 @@ class PPOAgent:
                 has_skill_flat = worker_skills[b_indices_expanded, w_indices_expanded, t_indices_expanded] > 0.5
                 skill_mask = (~has_skill_flat).view(B_size, Max_W_size).to(self.device)
                 
-                curr_mask = curr_mask | skill_mask
+                s_act = batch.y_station + 1 # [B]
+                worker_locks = worker_raw[:, :, 12] # [B, Max_W]
+                s_act_expanded = s_act.view(B_size, 1).expand(B_size, Max_W_size).to(self.device)
+                lock_mask = (worker_locks != 0) & (worker_locks != s_act_expanded)
+                
+                curr_mask = curr_mask | skill_mask | lock_mask.to(self.device)
                 
                 for k in range(batch.y_team.size(1)):
                     target = batch.y_team[:, k] 

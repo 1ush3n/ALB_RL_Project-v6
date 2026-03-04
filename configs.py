@@ -4,14 +4,14 @@ class configs:
     # 路径配置 (Paths)
     # ------------------
     # 默认数据路径 (如果没有通过命令行参数指定)
-    data_file_path = "3000.csv" 
+    data_file_path = "100.csv" 
     
     # ------------------
     # 环境与图相关 (Environment & Graph)
     # ------------------
-    n_j = 3300                     # 任务(工序)数量估计 (Graph Nodes)
+    n_j = 715                     # 任务(工序)数量估计 (Graph Nodes)
     n_m = 5                        # 站位数量 (Stations)
-    n_w = 30                        # 工人数量 (Workers)
+    n_w = 60                        # 工人数量 (Workers)
                                     # 注意：实际任务数由 data_loader 动态加载，此处仅作参考或 Embedding 初始化上界
     
     # ------------------
@@ -24,7 +24,7 @@ class configs:
     
     # 输入特征维度 (根据 environment.py 中的 _get_observation 定义)
     task_feat_dim = 17              # Task Node Input Features [Duration, Status(4), Type(10), Wait(1), Demand(1)]
-    worker_feat_dim = 12            # Worker Node Input Features [Efficiency(1), Skills(10), IsFree(1)]
+    worker_feat_dim = 13            # Worker Node Input Features [Efficiency(1), Skills(10), IsFree(1), Lock(1)]
     station_feat_dim = 8            # Station Node Input Features [Load(1), NumTasks(1), Padding(6)]
     
     # ------------------
