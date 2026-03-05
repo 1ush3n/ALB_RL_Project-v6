@@ -163,7 +163,7 @@ class GeneticAlgorithmScheduler:
             _, _, done, _ = sim_env.step(action)
             
         if done:
-            total_makespan = np.max(sim_env.station_loads)
+            total_makespan = np.max(sim_env.station_wall_clock)
             total_balance_std = np.std(sim_env.station_loads)
             
         # 以 makespan 为第一适应度 (越小越好)，balance 为次要 (与 RL 环境中的惩罚权重 1:1 绝对对齐)

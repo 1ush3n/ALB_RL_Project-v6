@@ -97,8 +97,8 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
             rewards.append(total_reward - 10000.0)
             schedules.append([])
         else:
-            makespans.append(np.max(env.station_loads))
-            balances.append(np.std(env.station_loads))
+            makespans.append(np.max(env.station_wall_clock)) # [CRITICAL] True physical completion time!
+            balances.append(np.std(env.station_loads))     # [Maintain] Use workloads for labor distribution stats
             rewards.append(total_reward)
             schedules.append(env.assigned_tasks)
         
@@ -263,9 +263,16 @@ def train(args):
                 if done:
                     break
             
+            # 提取每次训练结束时的实时完工耗时
+            ep_makespan = np.max(env.station_wall_clock) if len(env.assigned_tasks) > 0 else 0.0
+            is_deadlock = len(env.assigned_tasks) < env.num_tasks
+            status_str = "[DEADLOCK]" if is_deadlock else "[COMPLETED]"
+            
             # 记录日志
             writer.add_scalar('Reward/Episode', ep_reward, ep)
-            print(f"Episode {ep} | Reward: {ep_reward:.2f} | Steps: {t+1}")
+            writer.add_scalar('Train/WallClock_Makespan', ep_makespan, ep)
+            
+            print(f"Episode {ep} {status_str} | Reward: {ep_reward:.2f} | Steps: {t+1} | Makespan: {ep_makespan:.1f}")
             
             # PPO 更新
             if ep % update_every_episodes == 0:
@@ -280,10 +287,10 @@ def train(args):
                 # 在训练过程中，使用较少的多轮评估 (如 3 轮)，带有极小温度 (如 0.0) 以检测绝对贪婪上线
                 makespan, balance, eval_reward, best_sch = evaluate_model(env, agent, num_runs=3, temperature=configs.eval_temperature)
                 
-                print(f"[Eval] Ep {ep} | Avg Makespan: {makespan:.1f} | Avg Balance: {balance:.2f} | AvgReward: {eval_reward:.2f}")
+                print(f"[Eval] Ep {ep} | Avg Real-Makespan: {makespan:.1f} | Avg Workload-Balance_Std: {balance:.2f} | AvgReward: {eval_reward:.2f}")
                 
-                writer.add_scalar('Eval/Makespan', makespan, ep)
-                writer.add_scalar('Eval/Balance_Std', balance, ep)
+                writer.add_scalar('Eval/WallClock_Makespan', makespan, ep)
+                writer.add_scalar('Eval/Workload_Balance_Std', balance, ep)
                 
                 # Save Latest
                 torch.save({

@@ -263,6 +263,7 @@ class AirLineEnv_Graph(gym.Env):
         self.worker_free_time = np.zeros(self.num_workers, dtype=float)
         self.worker_locks = np.zeros(self.num_workers, dtype=int)
         self.station_loads.fill(0.0)
+        self.station_wall_clock.fill(0.0)
         self.event_queue = []
         
         self.assigned_tasks = [] 
@@ -461,8 +462,12 @@ class AirLineEnv_Graph(gym.Env):
             if self.worker_locks[w] == 0 and station_id != -1:
                 self.worker_locks[w] = station_id + 1
         
-        # 更新站位负载 (近似值，用于 Makespan 估算)
-        self.station_loads[station_id] += duration 
+        if station_id != -1:
+            # 更新站位工作量总和 (Workload - 人.小时)
+            self.station_loads[station_id] += duration * len(team) 
+            
+            # [CRITICAL FIX] 更新真实的站位物理下班时间 (Wall-Clock Makespan)
+            self.station_wall_clock[station_id] = max(self.station_wall_clock[station_id], finish_time)
         
         # 更新任务状态
         self.task_status[task_id] = 2 # 2=已调度
@@ -525,17 +530,20 @@ class AirLineEnv_Graph(gym.Env):
         reward -= blocked_penalty
         
         # D. Dense Makespan Reward (取代原来的稀疏惩罚)
-        # 记录执行后的 makespan
-        new_makespan = np.max(self.station_loads)
-        delta_makespan = new_makespan - prev_makespan
-        # 移除截断，防止发生突破上限后不受惩罚的漏洞
-        reward -= getattr(configs, 'r_coef_makespan', 0.5) * delta_makespan
+        # 用真实的 Wall-Clock Makespan 来引导强化学习
+        new_makespan = np.max(self.station_wall_clock) if len(self.assigned_tasks) > 0 else 0.0
+        # 此处使用伪单调增量 (这里有点复杂，因为真正的makespan在前面工位做完前不明显，我们取负载方差为终局惩罚)
         
         # E. 终局奖励 (Final Reward)
         done = (len(self.assigned_tasks) == self.num_tasks)
         if done:
+            # 这是所有任务分配完后的最终下班时间
+            makespan = np.max(self.station_wall_clock)
+            # 基础大惩罚 (鼓励整体变短)
+            reward -= getattr(configs, 'r_coef_makespan', 0.5) * makespan
+            
             # [Hybrid Masking & Shaping] 站位平衡惩罚 (Balance Penalty)
-            # 秋后算账：前期不管，但完工结算时如果各个站位总耗时极不均衡，给予巨大的非线性惩罚 (原本0.5 -> 增加到2.0或更大)
+            # 衡量的是每个站位的大家累计“工作总量(工时)”是否大致平均
             st_std = np.std(self.station_loads)
             reward -= 2.5 * st_std 
         
@@ -665,13 +673,23 @@ class AirLineEnv_Graph(gym.Env):
             max_cap_ratio = getattr(configs, 'max_station_capacity_ratio', 0.6)
             capacity_limit = int(self.num_workers * max_cap_ratio)
             
+            # [Hybrid Masking] 3. 站位工时过载防波堤 (Workload Limit)
+            # 平均每个工位的理论工作量上限： 总量 / 站位数 * 1.5 倍容忍度
+            workload_limit = (self.total_base_workload / self.num_stations) * 1.5 
+            
             for s in station_range:
                 if s < 0 or s >= self.num_stations: continue
                 
-                # 检查该站位是否已经爆满
+                # 检查该站位是否已经满负荷 (物理工位挤满了)
                 current_bound = np.sum(self.worker_locks == s + 1)
                 if current_bound >= capacity_limit:
                     continue # 爆满，物理屏蔽该站位，强迫推往下游
+                    
+                # 检查该站位是否工时堆积过度 (工作全被前排大包揽，导致下游吃灰)
+                if self.station_loads[s] >= workload_limit:
+                    # 对于极度吃重的最后一站略微放宽，但前排绝不姑息
+                    if s < self.num_stations - 1:
+                        continue
                 
                 # 检查能够支持在这个站位s工作的空闲人员：即 未绑定(0) 或 已经绑定到(s+1) 的人，并且拥有 req_skill
                 compatible_lock = (free_locks == 0) | (free_locks == s + 1)
@@ -763,6 +781,7 @@ class AirLineEnv_Graph(gym.Env):
             'worker_free_time': self.worker_free_time.copy(),
             'worker_locks': self.worker_locks.copy(),
             'station_loads': self.station_loads.copy(),
+            'station_wall_clock': self.station_wall_clock.copy(),
             'current_time': self.current_time,
             'edge_ts_cnt': self.edge_ts_cnt,
             'edge_tw_cnt': self.edge_tw_cnt,
@@ -798,6 +817,8 @@ class AirLineEnv_Graph(gym.Env):
         
         station_x = self.base_station_x.clone()
         station_x[:, 0] = torch.tensor(snapshot['station_loads'], dtype=torch.float) / 1000.0
+        # Incorporate the true wall clock internally since it replaces the role of simple loads
+        # Using loads as a standard neural feature, while Wall-clock is tracked in standard Python vars.
         
         global_mobile_count = np.sum(snap_locks == 0)
         station_x[:, 2] = float(global_mobile_count) / snap_num_workers
