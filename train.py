@@ -192,6 +192,10 @@ def train(args):
         
         for ep in range(start_episode, configs.max_episodes + 1):
             
+            # [Temperature Annealing] 计算当前环境的探索“温度”
+            decay_ratio = min(1.0, (ep - 1) / max(1, getattr(configs, 'temp_decay_episodes', 2000)))
+            current_temp = getattr(configs, 'temp_start', 2.0) - decay_ratio * (getattr(configs, 'temp_start', 2.0) - getattr(configs, 'temp_end', 0.1))
+            
             # [Domain Randomization] 如果配置开启泛化性抗干扰，则给环境施加动态工时噪音
             apply_noise = getattr(configs, 'randomize_durations', False)
             state = env.reset(randomize_duration=apply_noise, randomize_workers=apply_noise)
@@ -236,13 +240,14 @@ def train(args):
                      # 这里仅作警告。
                      pass
                 
-                # 选择动作 (Stochastic)
+                # 选择动作 (Stochastic with Annealed Temperature)
                 action, logprob, val, _ = agent.select_action(
                     state.to(device), 
                     mask_task=t_mask, 
                     mask_station_matrix=s_mask,
                     mask_worker=w_mask,
-                    deterministic=False
+                    deterministic=False,
+                    temperature=current_temp
                 )
                 
                 # 执行动作

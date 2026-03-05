@@ -11,20 +11,19 @@ class configs:
     # ------------------
     # 环境与图相关 (Environment & Graph)
     # ------------------
-    all_skills_mode = False         # [Debug Mode] 若开启，则强无视工人具体技能分布，将所有人设为全能法师 (全部为1) 
-    n_j = 715                       # 任务(工序)数量估计 (Graph Nodes)
-    n_m = 3                         # 站位数量 (Stations)
-    n_w_max = 100                   # 工人池总上限 (最大可配置的工人数量，固定池容量)
-    n_w_min = 30                    # 每回合训练随机抽取的最小工人数 (Domain Randomization)
-    n_w = 90                        # 每回合训练抽取的最大工人数，及验证(Eval)阶段固定的工人数
+    n_j = 3300                       # 任务(工序)数量估计 (Graph Nodes)
+    n_m = 5                         # 站位数量 (Stations)
+    n_w_max = 120                   # 工人池总上限 (最大可配置的工人数量，固定池容量)
+    n_w_min = 50                    # 每回合训练随机抽取的最小工人数 (Domain Randomization)
+    n_w = 100                        # 每回合训练抽取的最大工人数，及验证(Eval)阶段固定的工人数
                                     # 注意：实际任务数由 data_loader 动态加载，此处仅作参考或 Embedding 初始化上界
-    max_station_capacity_ratio = 0.6  # [Hybrid Masking] 单个站位最大容许绑定全厂总人数的比例，超过此值则站位被强制 Mask 屏蔽
+    max_station_capacity_ratio = 0.4  # [Hybrid Masking] 单个站位最大容许绑定全厂总人数的比例，超过此值则站位被强制 Mask 屏蔽
     
     # ------------------
     # 模型超参数 (Model Hyperparameters)
     # ------------------
     hidden_dim = 128                # 隐藏层维度 (Embedding Size)
-    num_gat_layers = 3              # GAT 层数 (Message Passing Depth)
+    num_gat_layers = 5              # GAT 层数 (Message Passing Depth)
     num_heads = 4                   # 多头注意力头数 (Attention Heads)
     dropout = 0.1                  # Dropout 比率 (防止过拟合)
     
@@ -42,15 +41,20 @@ class configs:
     # ------------------
     # PPO 训练超参数 (PPO Training)
     # ------------------
+    # [Temperature Annealing] 行动温度退火机制
+    temp_start = 2.0                # 初期高温度：鼓励广泛探索各站位和离谱策略组合
+    temp_end = 0.1                  # 后期低温度：收拢为贪心，精练出局部最佳解
+    temp_decay_episodes = 2000      # 经过多少 Episode 退火降至 temp_end
+    
     lr = 1e-4                       # 初始学习率 (3000节点序列极长，不可轻易放大以免陷入局部最优死坑)
     gamma = 0.9995                  # [治病良方：时间折现因子] 3000步超级长线，必须将远视能力拉满！(1 / (1-0.9995) = 2000步视野)
     k_epochs = 2                    # 每次更新循环次数 (每次少吸取一点教训，防止把错误的局部真理当做全局真理)
     eps_clip = 0.2                  # PPO Clip阈值 (e.g. 0.1 ~ 0.2)
-    batch_size = 16                 # [防 OOM] 严重缩编 Batch Size，避免激活矩阵爆炸!
+    batch_size = 8                 # [防 OOM + 性能提升] 适当放宽至 8 兼顾 8G 显存稳定性
     
     # [Loss Balancing & Critic Isolation 2026-02-22]
     c_policy = 1.0                  # Policy Loss 权重
-    c_value = 0.5                   # [已通过 Huber Loss 防爆] 安全调回标准的 0.5，Critic 不会再破坏全局梯度
+    c_value = 0.05                   # [已通过 Huber Loss 防爆] 安全调回标准的 0.5，Critic 不会再破坏全局梯度
     # [2026-02-27] Reduce Entropy to force network out of the random uniform policy (blindness)
     # [针对 3000 单的长序列防死锁补丁] 面对巨量状态，初期随机性非常关键。不可过低。
     c_entropy = 0.05                
@@ -65,7 +69,7 @@ class configs:
     max_episodes = 3000             # 探索万亿级组合的三千大劫
     update_every_episodes = 2       # 多少个 Episode 收集一次数据进行 PPO 更新
     eval_freq = 2                  # 多少个 Episode 进行一次评估
-    eval_temperature = 0.0         # 评估/推理时的采样温度 (0.0 表示确定的 Argmax 贪婪策略)
+    eval_temperature = 1.0         # 评估/推理时的采样温度 (0.0 表示确定的 Argmax 贪婪策略)
     
     # [Learning Rate Schedule]
     lr_warmup_steps = 3           # 学习率预热步数 (Linear Warmup)

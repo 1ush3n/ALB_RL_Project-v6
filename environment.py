@@ -142,18 +142,6 @@ class AirLineEnv_Graph(gym.Env):
              pool_path = os.path.join(os.getcwd(), pool_path)
              
         full_worker_df = pd.read_csv(pool_path)
-        
-        # [Robustness & Scalability] 
-        # 如果您在 3000 工序数据集中调高了 config.n_w (比如去到 120)，
-        # 而固定生成的 CSV 池子里只有 100 人，就会越界引发 tensor shape 错误。
-        # 这里进行动态平滑拓展，随机复用已有工人数据填补空缺！
-        config_max_w = getattr(configs, 'n_w', 90)
-        if len(full_worker_df) < config_max_w:
-            lack = config_max_w - len(full_worker_df)
-            padding_df = full_worker_df.sample(n=lack, replace=True)
-            full_worker_df = pd.concat([full_worker_df, padding_df], ignore_index=True)
-            print(f"[Robustness] 自动扩充初始工人池：发现配置文件设定的工人总数 ({config_max_w}) 大于固定数据池容量 ({len(full_worker_df)-lack})。已自动补充扩展。")
-            
         self.n_w_max = len(full_worker_df)
         self.full_worker_efficiency = full_worker_df['efficiency'].values
         self.full_worker_skill_matrix = torch.tensor(
@@ -161,10 +149,6 @@ class AirLineEnv_Graph(gym.Env):
             dtype=torch.float
         )
         
-        if getattr(configs, 'all_skills_mode', False):
-            self.full_worker_skill_matrix.fill_(1.0)
-            print("[Debug] ⚠️ 已开启全知全能工人模式 (All-Skills Mode)！环境初始化时将无视 CSV 技能分布。")
-            
         # Default workers (used in eval)
         self.num_workers = getattr(configs, 'n_w', 90)
         
@@ -468,8 +452,9 @@ class AirLineEnv_Graph(gym.Env):
         """
         task_id, station_id, team = action
         
-        # 记录执行前的 makespan
-        prev_makespan = np.max(self.station_loads)
+        # 记录执行前的 makespan 与平衡差 (Telescoping Sum Calculation Base)
+        prev_makespan = np.max(self.station_wall_clock)
+        prev_std = np.std(self.station_loads)
         
         # 1. 执行逻辑
         duration = self.calculate_duration(task_id, team)
@@ -517,50 +502,55 @@ class AirLineEnv_Graph(gym.Env):
         self._advance_time()
         
         # 4. 奖励函数计算 (Dense Reward)
-        # =========================================================
-        # [Scheme B 进度本位法 + 弹性大后摇] 
-        # =========================================================
-        
-        # --- 原有繁复的单步惩罚机制已被挂起 (注释掉以备未来参考) ---
-        # # A. 完成奖励 (Completion Payout)
-        # reward = 1.0
-        # 
-        # # B. 工时惩罚 (Efficiency Penalty)
-        # reward -= 0.1 * duration
-        # 
-        # # C. 关键路径阻滞惩罚 (Blocking Penalty)
-        # ready_tasks = np.where(self.task_status == 1)[0]
-        # blocked_penalty = 0.0
-        # ... (算子省略以减少视觉干扰) ...
-        # reward -= blocked_penalty
-        
-        # --- 全新极其纯粹的进度奖励体系 ---
-        # [进度奖励: Progress Payout]
-        # 每成功完成一次“合规”的任务分配，稳稳地给予 +1 积极鼓励。
-        # 目的是让 PPO “有活干就有钱拿”，坚决杜绝它怕死锁而故意躲进角落啥也不做！
+        # ---------------------------
+        # A. 完成奖励 (Completion Payout)
         reward = 1.0
         
-        # E. 终局纯粹结算 (Terminal Hybrid Cleansing)
+        # B. 工时惩罚 (Efficiency Penalty)
+        reward -= 0.1 * duration
+        
+        # C. 关键路径阻滞惩罚 (Blocking Penalty)
+        # 如果关键任务已经 Ready，但因为刚才的分配导致现在没人手了，给予惩罚。
+        ready_tasks = np.where(self.task_status == 1)[0]
+        blocked_penalty = 0.0
+        
+        # 统计当前剩余的空闲工人技能
+        worker_mask_np = (self.worker_free_time <= self.current_time)
+        free_indices = np.where(worker_mask_np)[0]
+        current_skill_counts = {}
+        for w in free_indices:
+            skills = np.where(self.worker_skill_matrix[w] == 1)[0]
+            for s in skills:
+                current_skill_counts[s] = current_skill_counts.get(s, 0) + 1
+        
+        for t in ready_tasks:
+            if self.is_critical[t]:
+                req_skill = int(self.task_static_feat[t, 1].item())
+                req_demand = int(self.task_static_feat[t, 2].item())
+                avail = current_skill_counts.get(req_skill, 0)
+                
+                if avail < req_demand:
+                    # 关键任务被阻塞!
+                    blocked_penalty += 0.5
+                    
+        reward -= blocked_penalty
+        
+        # E. Dense Telescoping Makespan Reward (取代原来的稀疏惩罚)
+        # 用真实的 Wall-Clock Makespan 来引导强化学习的步进 Delta 预测
+        curr_makespan = np.max(self.station_wall_clock)
+        curr_std = np.std(self.station_loads)
+        
+        delta_makespan = curr_makespan - prev_makespan
+        delta_std = curr_std - prev_std
+        
+        coef_makespan = getattr(configs, 'r_coef_makespan', 1.0)
+        coef_std = 2.5
+        
+        # 将原有的 terminal 扣除分摊到每一步的改变中
+        reward -= (coef_makespan * delta_makespan) + (coef_std * delta_std)
+        
+        # F. 终局结算 (Final Cleansing)
         done = (len(self.assigned_tasks) == self.num_tasks)
-        if done:
-            # 1. 获取全局打卡总时长 (唯一衡量指标 KPI)
-            makespan = np.max(self.station_wall_clock)
-            # 2. 获取站位下班时间差 (墙上的时钟下班时间的方差，非简单工时)
-            st_std = np.std(self.station_wall_clock)
-            
-            # 3. 终局大赏与大罚！
-            # 计算逻辑：所有的做任务赚来的进度奖励 (+num_tasks) 几乎会被最后扣的负数吃满。
-            # 如果干得慢 (makespan 很大)，最后一天直接扣成严重负数。
-            # 如果方差极大 (st_std 很大)，额外施加惩罚以强逼平摊。
-            coef_makespan = getattr(configs, 'r_coef_makespan', 1.0)
-            
-            # --- 原有结算方案被注释保留 ---
-            # reward -= getattr(configs, 'r_coef_makespan', 0.5) * makespan
-            # reward -= 2.5 * np.std(self.station_loads)
-            
-            # 新架构终局扣款：
-            terminal_penalty = - (coef_makespan * makespan) - (0.5 * st_std)
-            reward += terminal_penalty 
         
         return self._get_observation(), reward, done, {}
 
