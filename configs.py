@@ -11,6 +11,7 @@ class configs:
     # ------------------
     # 环境与图相关 (Environment & Graph)
     # ------------------
+    all_skills_mode = False         # [Debug Mode] 若开启，则强无视工人具体技能分布，将所有人设为全能法师 (全部为1) 
     n_j = 715                       # 任务(工序)数量估计 (Graph Nodes)
     n_m = 3                         # 站位数量 (Stations)
     n_w_max = 100                   # 工人池总上限 (最大可配置的工人数量，固定池容量)

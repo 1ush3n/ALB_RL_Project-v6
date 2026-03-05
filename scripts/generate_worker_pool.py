@@ -12,7 +12,8 @@ def generate_worker_pool():
     np.random.seed(2026)
     random.seed(2026)
     
-    n_w_max = getattr(configs, 'n_w_max', 100)
+    # 根据用户请求，为了满足3000级别超大订单集的鲁棒性，直接生成 1000 名全技能库超级备用池！
+    n_w_max = 1000
     output_path = getattr(configs, 'worker_pool_path', 'data/worker_pool_fixed.csv')
     
     # 确保输出目录存在
