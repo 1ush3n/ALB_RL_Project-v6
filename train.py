@@ -119,7 +119,6 @@ def evaluate_model(env, agent, num_runs=1, temperature=None):
                 
             action, _, _, _, is_invalid = action_ret
             
-            from configs import configs
             if getattr(configs, 'ablation_no_mask', False) and is_invalid:
                 task_mask = torch.ones_like(task_mask) 
                 break
@@ -298,7 +297,6 @@ def train(args):
                 )
                 
                 # [Phase 5: Ablation Soft Penalty]
-                from configs import configs
                 if getattr(configs, 'ablation_no_mask', False) and is_invalid:
                      reward = -100.0  # Massive penalty for picking strictly invalid masked items
                      done = True      # Terminate episode immediately to prevent infinite loops of illegal actions

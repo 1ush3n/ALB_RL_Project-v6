@@ -273,7 +273,7 @@ class PPOAgent:
                 if is_eval:
                     # [Evaluation Strict Mode] 验证期间绝对不允许兜底作弊！
                     # 如果选不够人，说明策略出现断层死锁，直接将失败上传以施加真实的验证集惩罚。
-                    return None, 0.0, 0.0, None
+                    return None, 0.0, 0.0, None, True
                     
                 missing = demand - len(team_indices)
                 available_indices = torch.where(current_worker_mask == False)[0]
@@ -299,7 +299,18 @@ class PPOAgent:
             
             action_tuple = (t_idx, station_action.item(), team_indices)
             
-        return action_tuple, action_logprob.item(), state_value.item(), specific_station_mask
+            # [Phase 5] Check validity of action for soft penalty
+            is_invalid_action = False
+            if mask_task is not None and mask_task[t_idx].item():
+                is_invalid_action = True
+            if specific_station_mask is not None and specific_station_mask[0, station_action.item()].item():
+                is_invalid_action = True
+            if mask_worker is not None:
+                for w_idx in team_indices:
+                    if mask_worker[w_idx].item():
+                        is_invalid_action = True
+            
+        return action_tuple, action_logprob.item(), state_value.item(), specific_station_mask, is_invalid_action
 
     def update(self, memory, env=None):
         """

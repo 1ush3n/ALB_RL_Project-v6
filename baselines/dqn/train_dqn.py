@@ -103,7 +103,7 @@ def train_dqn(args):
             
             # Form action
             # DQN struggles to predict variable length workers. We just duplicate the worker to meet demand.
-            demand = max(1, int(env.obs_data['task'].x[t_idx, -1].item()))
+            demand = max(1, int(env.task_static_feat[t_idx, -1].item()))
             team = [w_idx] * demand
             
             action = (t_idx, s_idx, team)

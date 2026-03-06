@@ -45,14 +45,13 @@ def run_spt(args):
         
         # 3. 选择工人
         # 需要获取技能和锁定掩码
-        worker_feats = env.obs_data['worker'].x
-        worker_skills = worker_feats[:, 1:11]
-        task_type_idx = torch.argmax(env.obs_data['task'].x[t_idx, 5:15]).item()
-        demand = int(env.obs_data['task'].x[t_idx, -1].item())
+        worker_skills = env.worker_skill_matrix
+        task_type_idx = int(env.task_static_feat[t_idx, 1].item())
+        demand = int(env.task_static_feat[t_idx, 2].item())
         demand = max(1, demand)
         
         has_skill = worker_skills[:, task_type_idx] > 0.5
-        worker_locks = torch.argmax(worker_feats[:, 12:20], dim=1)
+        worker_locks = env.worker_locks
         
         valid_workers = []
         for w in range(env.num_workers):

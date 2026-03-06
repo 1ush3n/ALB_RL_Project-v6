@@ -19,17 +19,29 @@ def run_generalization(args):
     print(f"目标验证环境: {args.test_data}")
     print(f"==================================================")
     
-    if not os.path.exists(args.model_path):
-        print(f"错误: 找不到模型权重文件 {args.model_path}")
-        return
-        
-    if not os.path.exists(args.test_data):
-        print(f"错误: 找不到测试数据集 {args.test_data}")
-        return
+    model_path = args.model_path
+    if not os.path.exists(model_path):
+         # 尝试从父目录或根目录搜寻
+         fallback = os.path.join(current_dir, model_path)
+         if os.path.exists(fallback):
+             model_path = fallback
+         else:
+             print(f"错误: 找不到模型权重文件 {args.model_path}")
+             print(f"提示: 请先运行 python train.py 并且等待收敛后生成 best_model.pth!")
+             return
+             
+    test_data = args.test_data
+    if not os.path.exists(test_data):
+         fallback = os.path.join(current_dir, test_data)
+         if os.path.exists(fallback):
+             test_data = fallback
+         else:
+             print(f"错误: 找不到测试数据集 {args.test_data}")
+             return
 
     # 初始化测试环境
-    print(f"正在构建目标环境 {args.test_data} 的巨型拓扑图与特征...")
-    env = AirLineEnv_Graph(data_path=args.test_data, seed=2026)
+    print(f"正在构建目标环境 {test_data} 的巨型拓扑图与特征...")
+    env = AirLineEnv_Graph(data_path=test_data, seed=2026)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     agent = PPOAgent(
@@ -47,22 +59,26 @@ def run_generalization(args):
     )
     
     # Load Weights
-    print("正在加载预训练强化大脑网络权重...")
-    checkpoint = torch.load(args.model_path, map_location=device)
+    print(f"正在加载预训练强化大脑网络权重: {model_path} ...")
+    checkpoint = torch.load(model_path, map_location=device)
     try:
-        agent.policy.load_state_dict(checkpoint['model_state_dict'])
+        # 兼容两种保存格式：存了整个 state_dict，或是存了检查点 dict
+        if 'model_state_dict' in checkpoint:
+            agent.policy.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            agent.policy.load_state_dict(checkpoint)
         print("✅ 权重解析融合成功！")
-    except RuntimeError as e:
-        print(f"加载模型权重发生维度冲突，泛化失败。错误详情：{e}")
+    except Exception as e:
+        print(f"加载模型权重发生冲突，泛化失败。错误详情：{e}")
         return
         
-    print(f"\n开始执行针对 {args.test_data} 的端到端推理排程演算...")
+    print(f"\n开始执行针对 {test_data} 的端到端推理排程演算...")
     # Because it is a completely different dataset, we still use evaluate_model deterministically
     ppo_makespan, ppo_balance, _, ppo_assigned, ppo_duration = evaluate_model(env, agent, num_runs=1, temperature=0.0)
     
     # Report Generalization Stats
     print("\n" + "#"*60)
-    print(f"🎯 泛化测试成绩单 [{args.test_data}]")
+    print(f"🎯 泛化测试成绩单 [{test_data}]")
     print("-" * 60)
     print(f"| 指标                  | 成绩             |")
     print(f"|-----------------------|------------------|")
@@ -77,8 +93,8 @@ def run_generalization(args):
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, required=True, help='Path to the trained best_model.pth')
-    parser.add_argument('--test_data', type=str, required=True, help='Path to the new evaluation dataset')
+    parser.add_argument('--model_path', type=str, default="best_model.pth", help='Path to the trained best_model.pth')
+    parser.add_argument('--test_data', type=str, default="data/ABC.csv", help='Path to the new evaluation dataset')
     args = parser.parse_args()
     
     run_generalization(args)
