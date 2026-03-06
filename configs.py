@@ -50,7 +50,7 @@ class configs:
     gamma = 0.9995                  # [治病良方：时间折现因子] 3000步超级长线，必须将远视能力拉满！(1 / (1-0.9995) = 2000步视野)
     k_epochs = 2                    # 每次更新循环次数 (每次少吸取一点教训，防止把错误的局部真理当做全局真理)
     eps_clip = 0.2                  # PPO Clip阈值 (e.g. 0.1 ~ 0.2)
-    batch_size = 8                 # [防 OOM + 性能提升] 适当放宽至 8 兼顾 8G 显存稳定性
+    batch_size = 2                 # [防 OOM + 性能提升] 适当放宽至 8 兼顾 8G 显存稳定性
     
     # [Loss Balancing & Critic Isolation 2026-02-22]
     c_policy = 1.0                  # Policy Loss 权重

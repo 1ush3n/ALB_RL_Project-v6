@@ -1,136 +1,243 @@
 import os
 import sys
 import time
-import argparse
-import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import pandas as pd
+from collections import deque
 
+# 添加根路径以便导入外部模块
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(os.path.dirname(current_dir))
 sys.path.append(parent_dir)
 
-from environment import AirLineEnv_Graph
+from args_parser import get_dqn_parser
+from env_wrapper import init_env, standardize_env_reset, standardize_env_step, extract_flat_state_for_baselines
+from utils.logger import init_logger, record_experiment_time
+from utils.device_utils import get_available_device, clear_torch_cache
 
-class NaiveDQN(nn.Module):
-    def __init__(self, obs_dim, action_dim):
-        super(NaiveDQN, self).__init__()
-        # Standard MLP for DQN
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, action_dim)
-        )
+# DQN网络（适配环境MultiDiscrete动作空间）
+class DQN(nn.Module):
+    def __init__(self, state_dim, action_dim_list, hidden_dim=128):
+        super(DQN, self).__init__()
+        # 共享特征层
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        # 动作分支（适配MultiDiscrete: [task, station, worker_leader]）
+        self.task_head = nn.Linear(hidden_dim, action_dim_list[0])
+        self.station_head = nn.Linear(hidden_dim, action_dim_list[1])
+        self.worker_head = nn.Linear(hidden_dim, action_dim_list[2])
         
     def forward(self, x):
-        return self.net(x)
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        task_logits = self.task_head(x)
+        station_logits = self.station_head(x)
+        worker_logits = self.worker_head(x)
+        return task_logits, station_logits, worker_logits
+
+class DQNAgent:
+    def __init__(self, state_dim, action_dim_list, args, device):
+        self.device = device
+        self.gamma = args.gamma
+        self.epsilon = args.epsilon
+        self.epsilon_min = args.epsilon_min
+        self.epsilon_decay = args.epsilon_decay
+        self.action_dim_list = action_dim_list
+        
+        # 初始化网络
+        self.model = DQN(state_dim, action_dim_list).to(device)
+        self.target_model = DQN(state_dim, action_dim_list).to(device)
+        self.target_model.load_state_dict(self.model.state_dict())
+        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        self.loss_fn = nn.MSELoss()
+        
+        # 经验回放池（限制大小，避免内存溢出）
+        self.memory = deque(maxlen=getattr(args, 'memory_size', 10000))
+        
+    def select_action(self, state, env_for_demand=None):
+        """
+        带探索的动作选择，适配MultiDiscrete动作空间
+        """
+        if np.random.rand() <= self.epsilon:
+            # 随机动作（探索）
+            task = np.random.randint(0, self.action_dim_list[0])
+            station = np.random.randint(0, self.action_dim_list[1])
+            worker = np.random.randint(0, self.action_dim_list[2])
+        else:
+            # 贪心动作（利用）
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                task_logits, station_logits, worker_logits = self.model(state_tensor)
+                task = torch.argmax(task_logits).item()
+                station = torch.argmax(station_logits).item()
+                worker = torch.argmax(worker_logits).item()
+                
+        # To avoid ValueError unpacking in env.step due to list size
+        if env_for_demand is not None:
+             demand = int(env_for_demand.task_static_feat[task, 2].item())
+             demand = max(1, demand)
+             team = [abs(worker + i) % self.action_dim_list[2] for i in range(demand)]
+        else:
+             team = [worker]
+        return (task, station, team)
+    
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+    
+    def replay(self, batch_size):
+        """
+        经验回放，分批训练避免内存溢出
+        """
+        if len(self.memory) < batch_size:
+            return 0.0
+        
+        batch_indices = np.random.choice(len(self.memory), batch_size, replace=False)
+        losses = []
+        
+        # 为了高效，可以将这里向量化。现在先用最稳妥的逐条计算
+        for idx in batch_indices:
+            state, action, reward, next_state, done = self.memory[idx]
+            
+            # 转换为tensor
+            state_tensor = torch.tensor(state, dtype=torch.float32).to(self.device)
+            next_state_tensor = torch.tensor(next_state, dtype=torch.float32).to(self.device)
+            reward_tensor = torch.tensor(reward, dtype=torch.float32).to(self.device)
+            
+            # 当前Q值
+            task_logits, station_logits, worker_logits = self.model(state_tensor)
+            task_a, station_a, team_a = action
+            leader_a = team_a[0]
+            q_current = (task_logits[task_a] + station_logits[station_a] + worker_logits[leader_a]) / 3.0
+            
+            # 目标Q值
+            if done:
+                q_target = reward_tensor
+            else:
+                with torch.no_grad():
+                    next_task_logits, next_station_logits, next_worker_logits = self.target_model(next_state_tensor)
+                    next_q = (torch.max(next_task_logits) + torch.max(next_station_logits) + torch.max(next_worker_logits)) / 3.0
+                q_target = reward_tensor + self.gamma * next_q
+            
+            # 计算损失
+            loss = self.loss_fn(q_current, q_target)
+            losses.append(loss.item())
+            
+            # 反向传播
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+        
+        # 衰减探索率
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+        
+        return np.mean(losses) if losses else 0.0
 
 def train_dqn(args):
-    print(f"--- 启动 Baseline: 传统 DQN (Deep Q-Network) ---")
-    print(f"警告：传统 DQN 需要展平状态并输出庞大变长离散组合动作的全部 Q 值。")
-    print(f"在应对复杂装配线排程环境时，极易面临动作空间爆炸或内存溢出 (OOM)！")
-    
-    env = AirLineEnv_Graph(data_path=args.data_path, seed=2026)
-    
-    # [动作空间复杂度计算] 
-    # 假设任务只由 1~2 人组成，简化组合。若组合过大直接引发 MemoryError。
-    num_tasks = env.num_tasks
-    num_stations = env.num_stations
-    num_workers = env.num_workers
-    
-    # 为能够运行极小数据集(如 50 节点)，设定只选1人的简化动作空间，其余工人补0。
-    # 真实情况：C(W, D)，我们这里仅使用 Task * Station * Worker 作为极简动作
-    action_space_size = num_tasks * num_stations * num_workers
-    print(f"[{args.data_path}] 当前简化动作空间大小: {action_space_size} 维")
-    
-    if action_space_size > 5000000:
-        print("\n[CRITICAL ERROR] 动作空间过于庞大，超出了 DQN Q-Table 显存极限。发生 OOM (Out Of Memory) 崩溃！")
-        print("这证明了传统 DQN 无法胜任该图装配线调度任务，凸显了自回归指针网络 (Pointer Network) 的空间压缩降维优势。")
-        sys.exit(1)
-        
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 估算观测特征展平后的维度
-    obs_dim = env.task_static_feat.shape[1] * num_tasks + env.worker_static_feat.shape[1] * num_workers
-    
-    try:
-        dqn = NaiveDQN(obs_dim, action_space_size).to(device)
-        optimizer = optim.Adam(dqn.parameters(), lr=1e-3)
-    except Exception as e:
-        print(f"尝试初始化 DQN 网络失败: {e}")
-        sys.exit(1)
-        
-    epsilon = 1.0
-    epsilon_decay = 0.995
-    epsilon_min = 0.05
-    
-    print("\n开始 DQN 训练循环 (预期: 难以收敛且经常陷入死锁惩罚) ...")
+    # 初始化日志
+    logger, exp_dir = init_logger(args, "dqn_baseline")
     start_time = time.time()
     
-    for ep in range(args.max_episodes):
-        env.reset(randomize_duration=False)
-        done = False
-        ep_reward = 0
+    try:
+        # 设备初始化
+        device = get_available_device()
+        # 环境初始化（统一接口）
+        env = init_env(args, seed=args.seed)
         
-        # 为了演示，直接跳过真实训练的数据采集，因为 DQN 前向映射太难正确处理屏蔽
-        # 这里模拟 DQN 的乱序探索
-        while not done:
-            task_mask, station_mask, worker_mask = env.get_masks()
-            
-            if task_mask.all():
-                ep_reward -= 10000.0
-                break
-                
-            # Random exploration or picking max Q
-            if random.random() < epsilon:
-                t_idx = random.randint(0, num_tasks - 1)
-                s_idx = random.randint(0, num_stations - 1)
-                w_idx = random.randint(0, num_workers - 1)
-            else:
-                # Mock Q-forward (DQN requires concatenated flat states, highly inefficient)
-                dummy_state = torch.randn(1, obs_dim).to(device)
-                q_vals = dqn(dummy_state)
-                best_action = torch.argmax(q_vals).item()
-                
-                # Decode
-                w_idx = best_action % num_workers
-                s_idx = (best_action // num_workers) % num_stations
-                t_idx = (best_action // (num_workers * num_stations))
-            
-            # Form action
-            # DQN struggles to predict variable length workers. We just duplicate the worker to meet demand.
-            demand = max(1, int(env.task_static_feat[t_idx, -1].item()))
-            team = [w_idx] * demand
-            
-            action = (t_idx, s_idx, team)
-            
-            # Since DQN has no topological graph constraint (Hard Masking is hard to apply to flat Q-values natively),
-            # it frequently triggers physical environment errors. We simulate this by checking constraints.
-            if task_mask[t_idx] or station_mask[t_idx, s_idx] or worker_mask[w_idx]:
-                 # Illegial action selected
-                 reward = -100.0
-                 done = True
-            else:
-                 _, reward, done, _ = env.step(action)
-                 
-            ep_reward += reward
-            
-        epsilon = max(epsilon_min, epsilon * epsilon_decay)
+        # 状态维度适配（使用降维展平方法）
+        standardize_env_reset(env)
+        flat_state = extract_flat_state_for_baselines(env)
+        state_dim = flat_state.shape[0]
         
-        if ep % 50 == 0:
-             print(f"Ep {ep:03d} | Epsilon: {epsilon:.2f} | DQN Reward: {ep_reward:.2f} (大多非法动作截断)")
-             
-    print(f"\nDQN 训练结束。耗时: {time.time() - start_time:.2f}秒")
-    print("结论: 传统价值网络在动作解耦、组合优化以及图掩码约束层面全面溃败。")
-    print("-------------------------------------------------------")
+        action_dim_list = [env.num_tasks, env.num_stations, env.num_workers]
+        
+        # 初始化Agent
+        agent = DQNAgent(state_dim, action_dim_list, args, device)
+        batch_size = getattr(args, 'batch_size', 32)
+        
+        # 训练指标
+        episode_rewards = []
+        episode_losses = []
+        episode_makespans = []
+        
+        # 训练循环
+        logger.info(f"开始 DQN 训练，状态维度: {state_dim}，动作维度: {action_dim_list}，最大轮次: {args.max_episodes}")
+        for ep in range(args.max_episodes):
+            standardize_env_reset(env)
+            state = extract_flat_state_for_baselines(env)
+            done = False
+            ep_reward = 0
+            ep_loss = 0
+            step_count = 0
+            max_steps = env.num_tasks * 2  # 防止无限循环
+            
+            while not done and step_count < max_steps:
+                step_count += 1
+                # 选择动作
+                action = agent.select_action(state, env_for_demand=env)
+                # 执行动作
+                _, reward, done, info = standardize_env_step(env, action)
+                next_state = extract_flat_state_for_baselines(env)
+                
+                # 存储经验
+                agent.remember(state, action, reward, next_state, done)
+                # 累加奖励
+                ep_reward += reward
+                # 经验回放
+                loss = agent.replay(batch_size)
+                ep_loss += loss
+                # 更新状态
+                state = next_state
+            
+            # 记录指标
+            episode_rewards.append(ep_reward)
+            episode_losses.append(ep_loss / step_count if step_count > 0 else 0)
+            
+            task_mask, _, _ = env.get_masks()
+            makespan = np.max(env.station_wall_clock) if not task_mask.all() else 99999.0
+            episode_makespans.append(makespan)
+            
+            # 每10轮打印日志
+            if (ep + 1) % 10 == 0:
+                avg_reward = np.mean(episode_rewards[-10:])
+                avg_loss = np.mean(episode_losses[-10:])
+                avg_makespan = np.mean(episode_makespans[-10:])
+                logger.info(f"Episode {ep+1}/{args.max_episodes} | 平均奖励: {avg_reward:.2f} | 损失: {avg_loss:.4f} | Makespan: {avg_makespan:.2f} | Epsilon: {agent.epsilon:.4f}")
+            
+            # 每50轮更新目标网络
+            if (ep + 1) % 50 == 0:
+                agent.target_model.load_state_dict(agent.model.state_dict())
+                # 清理缓存
+                clear_torch_cache()
+        
+        # 保存模型
+        model_path = os.path.join(exp_dir, "dqn_model.pth")
+        torch.save(agent.model.state_dict(), model_path)
+        logger.info(f"模型保存至: {model_path}")
+        
+        # 结果归档
+        results = pd.DataFrame({
+            'episode': range(1, args.max_episodes+1),
+            'reward': episode_rewards,
+            'loss': episode_losses,
+            'makespan': episode_makespans
+        })
+        results['avg_reward_10'] = results['reward'].rolling(window=10).mean()
+        results['avg_makespan_10'] = results['makespan'].rolling(window=10).mean()
+        results.to_csv(os.path.join(exp_dir, "dqn_results.csv"), index=False)
+        
+    except Exception as e:
+        logger.error(f"DQN训练失败: {str(e)}", exc_info=True)
+        raise
+    finally:
+        # 清理资源
+        record_experiment_time(logger, start_time)
+        clear_torch_cache()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, default="data/100.csv", help='Path to the dataset')
-    parser.add_argument('--max_episodes', type=int, default=200, help='Max training episodes')
+    parser = get_dqn_parser()
     args = parser.parse_args()
     train_dqn(args)

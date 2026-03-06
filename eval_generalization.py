@@ -92,9 +92,8 @@ def run_generalization(args):
     print("这种高维时效压制完美吊打了遗传算法每次遇到新问题都要重跑 5 分钟的致命缺陷！")
     
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default="best_model.pth", help='Path to the trained best_model.pth')
-    parser.add_argument('--test_data', type=str, default="data/ABC.csv", help='Path to the new evaluation dataset')
+    from args_parser import get_generalization_parser
+    parser = get_generalization_parser()
     args = parser.parse_args()
     
     run_generalization(args)

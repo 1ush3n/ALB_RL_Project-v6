@@ -1,36 +1,315 @@
 import os
 import sys
-import argparse
+import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
+import numpy as np
+import pandas as pd
 
+# 添加根路径以便导入外部模块
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(os.path.dirname(current_dir))
 sys.path.append(parent_dir)
 
-# Import the core training loop
-from train import train
-import configs
+from args_parser import get_basic_ppo_parser
+from env_wrapper import init_env, standardize_env_reset, standardize_env_step, extract_flat_state_for_baselines
+from utils.logger import init_logger, record_experiment_time
+from utils.device_utils import get_available_device, clear_torch_cache
 
-def run_basic_ppo():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, default="data/100.csv", help='Path to the dataset')
-    parser.add_argument('--resume', action='store_true', help='Resume training')
+# 基础PPO网络（仅MLP，无GAT/指针网络）
+class BasicPPO(nn.Module):
+    def __init__(self, state_dim, action_dim_list, hidden_dim=256):
+        super(BasicPPO, self).__init__()
+        # 共享MLP特征层
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        # 策略头（适配MultiDiscrete动作空间）
+        self.task_policy = nn.Linear(hidden_dim, action_dim_list[0])
+        self.station_policy = nn.Linear(hidden_dim, action_dim_list[1])
+        self.worker_policy = nn.Linear(hidden_dim, action_dim_list[2])
+        # 价值头
+        self.value_head = nn.Linear(hidden_dim, 1)
     
-    # 吸收所有参数，避免冲突
-    args, unknown = parser.parse_known_args()
+    def forward(self, x):
+        features = self.feature_extractor(x)
+        # 策略输出（logits）
+        task_logits = self.task_policy(features)
+        station_logits = self.station_policy(features)
+        worker_logits = self.worker_policy(features)
+        # 价值输出
+        value = self.value_head(features)
+        return task_logits, station_logits, worker_logits, value
+
+class BasicPPOAgent:
+    def __init__(self, state_dim, action_dim_list, args, device):
+        self.device = device
+        self.lr = args.lr
+        self.clip_epsilon = args.clip_epsilon
+        self.gamma = getattr(args, 'gamma', 0.99)
+        self.lamda = getattr(args, 'lamda', 0.95)
+        self.action_dim_list = action_dim_list
+        
+        # 初始化网络
+        self.model = BasicPPO(state_dim, action_dim_list).to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        
+        # 存储轨迹数据（每轮清空，避免内存溢出）
+        self.states = []
+        self.actions = []
+        self.log_probs = []
+        self.rewards = []
+        self.values = []
+        self.dones = []
     
-    print("=" * 60)
-    print("🚀 启动对比基线: Basic PPO (纯 MLP, 无图注意力, 无指针网络) 🚀")
-    print(">>> 正在剥离核心结构的图神经传导...")
-    print(">>> 正在剥离核心的自回归注意力交互...")
-    print("=" * 60)
+    def select_action(self, state, env_for_demand=None):
+        """
+        选择动作并记录概率/价值
+        """
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            task_logits, station_logits, worker_logits, value = self.model(state_tensor)
+            
+            # 构建分类分布
+            task_dist = Categorical(logits=task_logits)
+            station_dist = Categorical(logits=station_logits)
+            worker_dist = Categorical(logits=worker_logits)
+            
+            # 采样动作
+            task_action = task_dist.sample()
+            station_action = station_dist.sample()
+            worker_action = worker_dist.sample()
+            
+            # 记录log prob和value
+            log_prob = task_dist.log_prob(task_action) + station_dist.log_prob(station_action) + worker_dist.log_prob(worker_action)
+            value = value.item()
+        
+        task_idx = task_action.item()
+        
+        if env_for_demand is not None:
+             demand = int(env_for_demand.task_static_feat[task_idx, 2].item())
+             demand = max(1, demand)
+             team = [abs(worker_action.item() + i) % self.action_dim_list[2] for i in range(demand)]
+        else:
+             team = [worker_action.item()]
+             
+        action = (task_idx, station_action.item(), team)
+        
+        # 存储轨迹用于计算概率的 tuple 索引，不需要管队伍延展
+        recorded_action = (task_idx, station_action.item(), worker_action.item())
+        
+        self.states.append(state_tensor)
+        self.actions.append(recorded_action)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        
+        return action
     
-    # 强制动态写入消融配置，退化模型
-    setattr(configs, 'ablation_no_gat', True)
-    setattr(configs, 'ablation_no_pointer', True)
-    setattr(configs, 'ablation_no_mask', False) # 保留基础物理约束，防止训练完全停摆
+    def store_reward(self, reward, done):
+        self.rewards.append(reward)
+        self.dones.append(done)
     
-    # 调用主训练循环，生成的张量板和模型将体现其性能退化
-    train(args)
+    def compute_gae(self):
+        """
+        计算GAE优势函数
+        """
+        advantages = []
+        advantage = 0.0
+        next_value = 0.0
+        
+        for reward, done, value in reversed(list(zip(self.rewards, self.dones, self.values))):
+            td_error = reward + self.gamma * next_value * (1 - done) - value
+            advantage = td_error + self.gamma * self.lamda * (1 - done) * advantage
+            advantages.insert(0, advantage)
+            next_value = value
+        
+        returns = np.array(advantages) + np.array(self.values)
+        adv_array = np.array(advantages)
+        adv_mean = np.mean(adv_array)
+        adv_std = np.std(adv_array) if np.std(adv_array) > 1e-8 else 1e-8
+        advantages = list((adv_array - adv_mean) / adv_std)
+        return advantages, returns.tolist()
+    
+    def update(self, batch_size):
+        """
+        PPO更新，分批训练避免内存碎片
+        """
+        if len(self.states) < batch_size:
+             self.clear_memory()
+             return 0.0
+             
+        advantages, returns = self.compute_gae()
+        
+        # 转换为tensor
+        states = torch.cat(self.states, dim=0).to(self.device).detach()
+        log_probs_old = torch.cat(self.log_probs, dim=0).to(self.device).detach()
+        returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(self.device)
+        
+        # 分批更新 (多次 epochs 防止单样本浪费)
+        indices = np.arange(len(states))
+        np.random.shuffle(indices)
+        losses = []
+        
+        epochs = 4
+        for _ in range(epochs):
+            np.random.shuffle(indices)
+            for start in range(0, len(states), batch_size):
+                end = start + batch_size
+                batch_idx = indices[start:end]
+                
+                # 前向传播
+                task_logits, station_logits, worker_logits, values = self.model(states[batch_idx])
+                
+                # 重新计算动作概率
+                task_dist = Categorical(logits=task_logits)
+                station_dist = Categorical(logits=station_logits)
+                worker_dist = Categorical(logits=worker_logits)
+                
+                # 取出批次动作
+                batch_actions = [self.actions[i] for i in batch_idx]
+                task_actions = torch.tensor([a[0] for a in batch_actions], dtype=torch.int64).to(self.device)
+                station_actions = torch.tensor([a[1] for a in batch_actions], dtype=torch.int64).to(self.device)
+                worker_actions = torch.tensor([a[2] for a in batch_actions], dtype=torch.int64).to(self.device)
+                
+                log_probs_new = task_dist.log_prob(task_actions) + station_dist.log_prob(station_actions) + worker_dist.log_prob(worker_actions)
+                
+                # PPO裁剪
+                ratio = torch.exp(log_probs_new - log_probs_old[batch_idx])
+                surr1 = ratio * advantages[batch_idx]
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages[batch_idx]
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # 价值损失
+                value_loss = nn.MSELoss()(values.squeeze(-1), returns[batch_idx])
+                
+                # 总损失
+                entropy = (task_dist.entropy() + station_dist.entropy() + worker_dist.entropy()).mean()
+                total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+                
+                # 反向传播 (梯度裁剪)
+                self.optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                
+                losses.append(total_loss.item())
+        
+        # 清空轨迹
+        self.clear_memory()
+        
+        return np.mean(losses) if losses else 0.0
+
+    def clear_memory(self):
+        self.states.clear()
+        self.actions.clear()
+        self.log_probs.clear()
+        self.rewards.clear()
+        self.values.clear()
+        self.dones.clear()
+
+def train_basic_ppo(args):
+    # 初始化日志
+    logger, exp_dir = init_logger(args, "basic_ppo_baseline")
+    start_time = time.time()
+    
+    try:
+        # 设备初始化
+        device = get_available_device()
+        # 环境初始化（统一接口）
+        env = init_env(args, seed=args.seed)
+        
+        # 状态维度适配
+        standardize_env_reset(env)
+        flat_state = extract_flat_state_for_baselines(env)
+        state_dim = flat_state.shape[0]
+        
+        action_dim_list = [env.num_tasks, env.num_stations, env.num_workers]
+        
+        # 初始化Agent
+        agent = BasicPPOAgent(state_dim, action_dim_list, args, device)
+        batch_size = getattr(args, 'batch_size', 64)
+        
+        # 训练指标
+        episode_rewards = []
+        episode_losses = []
+        episode_makespans = []
+        
+        logger.info(f"开始 Basic PPO (MLP) 训练，状态维度: {state_dim}，动作维度: {action_dim_list}，最大轮次: {args.max_episodes}")
+        for ep in range(args.max_episodes):
+            standardize_env_reset(env)
+            state = extract_flat_state_for_baselines(env)
+            
+            done = False
+            ep_reward = 0
+            step_count = 0
+            max_steps = env.num_tasks * 2  # 防止无限循环
+            
+            while not done and step_count < max_steps:
+                step_count += 1
+                
+                action = agent.select_action(state, env_for_demand=env)
+                
+                _, reward, done, info = standardize_env_step(env, action)
+                next_state = extract_flat_state_for_baselines(env)
+                
+                agent.store_reward(reward, done)
+                
+                ep_reward += reward
+                state = next_state
+            
+            # 记录指标
+            episode_rewards.append(ep_reward)
+            
+            task_mask, _, _ = env.get_masks()
+            makespan = np.max(env.station_wall_clock) if not task_mask.all() else 99999.0
+            episode_makespans.append(makespan)
+            
+            loss = agent.update(batch_size)
+            episode_losses.append(loss)
+            
+            # 日志
+            if (ep + 1) % 10 == 0:
+                avg_reward = np.mean(episode_rewards[-10:])
+                avg_loss = np.mean(episode_losses[-10:])
+                avg_makespan = np.mean(episode_makespans[-10:])
+                logger.info(f"Episode {ep+1:04d}/{args.max_episodes} | 奖励: {ep_reward:.2f} (Avg: {avg_reward:.2f}) | Loss: {avg_loss:.4f} | Makespan: {makespan:.2f} (Avg: {avg_makespan:.2f})")
+                
+            # 每100轮清理与保存一次
+            if (ep + 1) % 100 == 0:
+                clear_torch_cache()
+                model_path = os.path.join(exp_dir, f"basic_ppo_model_ep{ep+1}.pth")
+                torch.save(agent.model.state_dict(), model_path)
+                
+        # 保存最终模型
+        model_path = os.path.join(exp_dir, "basic_ppo_model_final.pth")
+        torch.save(agent.model.state_dict(), model_path)
+        logger.info(f"最终模型保存至: {model_path}")
+        
+        # 结果归档
+        results = pd.DataFrame({
+            'episode': range(1, args.max_episodes+1),
+            'reward': episode_rewards,
+            'loss': episode_losses,
+            'makespan': episode_makespans
+        })
+        results['avg_makespan_10'] = results['makespan'].rolling(window=10).mean()
+        results.to_csv(os.path.join(exp_dir, "basic_ppo_results.csv"), index=False)
+        
+    except Exception as e:
+        logger.error(f"Basic PPO 训练失败: {str(e)}", exc_info=True)
+        raise
+    finally:
+        # 清理资源
+        record_experiment_time(logger, start_time)
+        clear_torch_cache()
 
 if __name__ == "__main__":
-    run_basic_ppo()
+    parser = get_basic_ppo_parser()
+    args = parser.parse_args()
+    train_basic_ppo(args)

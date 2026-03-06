@@ -164,6 +164,9 @@ def train(args):
         print(f"数据路径: {data_path}")
         # 固定种子以保证训练环境的一致性 (Determinism)
         env = AirLineEnv_Graph(data_path=data_path, seed=42)
+        
+        # [Validation] 单独开辟一个确定性验证环境，防止其污染训练轨迹状态
+        eval_env = AirLineEnv_Graph(data_path=data_path, seed=2026)
         print("环境初始化完成.")
         
         # 2. 初始化设备与模型
@@ -465,19 +468,16 @@ def train(args):
         traceback.print_exc()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--resume', action='store_true', help='Resume training from latest checkpoint')
-    
-    # [Phase 5: Ablation] 消融实验控制开关
-    parser.add_argument('--ablation_no_gat', action='store_true', help='Disable GAT layers (use raw features instead)')
-    parser.add_argument('--ablation_no_pointer', action='store_true', help='Disable Pointer Network (use simple linear match)')
-    parser.add_argument('--ablation_no_mask', action='store_true', help='Disable Hard Masking (use soft penalty constraint)')
-    
+    from args_parser import get_base_parser
+    parser = get_base_parser()
     args = parser.parse_args()
     
     # 动态写入 configs 对象，由于各处都会 import configs，可实现全局透传
     setattr(configs, 'ablation_no_gat', args.ablation_no_gat)
     setattr(configs, 'ablation_no_pointer', args.ablation_no_pointer)
     setattr(configs, 'ablation_no_mask', args.ablation_no_mask)
+    setattr(configs, 'data_file_path', args.data_path)
+    setattr(configs, 'seed', args.seed)
+    setattr(configs, 'max_episodes', args.max_episodes)
     
     train(args)

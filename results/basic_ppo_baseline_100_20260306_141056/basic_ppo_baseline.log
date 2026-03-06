@@ -1,0 +1,6 @@
+2026-03-06 14:10:56,837 - INFO - ========== basic_ppo_baseline 实验开始 ==========
+2026-03-06 14:10:56,837 - INFO - 实验参数: {'data_path': 'data/100.csv', 'seed': 42, 'max_episodes': 1, 'log_dir': 'tf-logs', 'result_dir': 'results', 'ablation_no_gat': False, 'ablation_no_pointer': False, 'ablation_no_mask': False, 'resume': False, 'lr': 0.0003, 'gamma': 0.99, 'lamda': 0.95, 'clip_epsilon': 0.2, 'batch_size': 64}
+2026-03-06 14:10:56,838 - INFO - 结果将归档至: results\basic_ppo_baseline_100_20260306_141056
+2026-03-06 14:10:57,211 - INFO - 开始 Basic PPO (MLP) 训练，状态维度: 2960，动作维度: [715, 5, 100]，最大轮次: 1
+2026-03-06 14:11:22,083 - INFO - 最终模型保存至: results\basic_ppo_baseline_100_20260306_141056\basic_ppo_model_final.pth
+2026-03-06 14:11:22,093 - INFO - 实验结束。总耗时: 0小时0分钟25秒
