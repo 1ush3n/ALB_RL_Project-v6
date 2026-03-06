@@ -92,10 +92,16 @@ class HeteroGATEncoder(nn.Module):
 class TaskPointer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # self.context_proj = nn.Linear(config.hidden_dim * 3, config.hidden_dim)
         self.context_proj = nn.Linear(config.hidden_dim * 6, config.hidden_dim) # 扩展为 Mean+Max 拼接后的 6 倍维度
         self.task_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.attn = nn.Linear(config.hidden_dim, 1)
+        
+        # [Phase 5: Ablation Fallback]
+        self.ablation_mlp = nn.Sequential(
+            nn.Linear(config.hidden_dim * 2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
 
     def forward(self, task_emb, global_context, mask=None):
         """
@@ -109,8 +115,25 @@ class TaskPointer(nn.Module):
              task_emb = task_emb.unsqueeze(0) # [1, N, H]
         
         tsk = self.task_proj(task_emb)      
-        features = torch.tanh(ctx + tsk) 
-        scores = self.attn(features).squeeze(-1) # [B, N]
+        
+        from configs import configs
+        if getattr(configs, 'ablation_no_pointer', False):
+            # Ablation: Simple Dense Network over Concatenated Features
+            B, _, H = ctx.shape
+            if tsk.dim() == 3:
+                _, N, _ = tsk.shape
+                ctx_expand = ctx.expand(B, N, H)
+                tsk_expand = tsk.expand(B, N, H)
+            else:
+                N = tsk.shape[0]
+                ctx_expand = ctx.expand(B, N, H)
+                tsk_expand = tsk.unsqueeze(0).expand(B, N, H)
+                
+            cat_feat = torch.cat([ctx_expand, tsk_expand], dim=-1)
+            scores = self.ablation_mlp(cat_feat).squeeze(-1)
+        else:
+            features = torch.tanh(ctx + tsk) 
+            scores = self.attn(features).squeeze(-1) # [B, N]
         
         if mask is not None:
              if mask.dim() == 1: mask = mask.unsqueeze(0)
@@ -156,6 +179,13 @@ class WorkerPointer(nn.Module):
         self.key_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.attn = nn.Linear(config.hidden_dim, 1)
         
+        # [Phase 5: Ablation Fallback]
+        self.ablation_mlp = nn.Sequential(
+            nn.Linear(config.hidden_dim * 2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        
         # Stop Head: 预测是否停止选人 [Logit_Continue, Logit_Stop]
         self.stop_head = nn.Linear(config.hidden_dim * 2, 2) 
 
@@ -163,8 +193,23 @@ class WorkerPointer(nn.Module):
         """选择下一个工人"""
         query = self.query_proj(task_emb).unsqueeze(1) 
         keys = self.key_proj(worker_embs)
-        features = torch.tanh(query + keys)
-        scores = self.attn(features).squeeze(-1) 
+        
+        from configs import configs
+        if getattr(configs, 'ablation_no_pointer', False):
+            B, _, H = query.shape
+            if keys.dim() == 3:
+                _, N, _ = keys.shape
+                q_expand = query.expand(B, N, H)
+                k_expand = keys.expand(B, N, H)
+            else:
+                N = keys.shape[0]
+                q_expand = query.expand(B, N, H)
+                k_expand = keys.unsqueeze(0).expand(B, N, H)
+            cat_feat = torch.cat([q_expand, k_expand], dim=-1)
+            scores = self.ablation_mlp(cat_feat).squeeze(-1)
+        else:
+            features = torch.tanh(query + keys)
+            scores = self.attn(features).squeeze(-1) 
         
         if mask is not None:
             scores = scores.masked_fill(mask, -1e9)
@@ -213,7 +258,13 @@ class HBGATPN(nn.Module):
         """
         # --- Step 1: 编码 ---
         x_dict = self.embedder(batch_data.x_dict)
-        x_dict_encoded = self.encoder(x_dict, batch_data.edge_index_dict)
+        
+        from configs import configs
+        if getattr(configs, 'ablation_no_gat', False):
+            # [Phase 5: Ablation] 跳过所有图卷积，直接使用投影后特征
+            x_dict_encoded = x_dict
+        else:
+            x_dict_encoded = self.encoder(x_dict, batch_data.edge_index_dict)
         
         # Global Context: 对 Station, Task, Worker 节点进行 Mean + Max Pooling, 实现全视角及瓶颈感知
         if hasattr(batch_data['station'], 'batch') and batch_data['station'].batch is not None:

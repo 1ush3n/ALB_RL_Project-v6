@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
@@ -62,9 +63,10 @@ class Memory:
 # ---------------------------------------------------------------------------
 # 评估函数
 # ---------------------------------------------------------------------------
-def evaluate_model(env, agent, num_runs=3, temperature=None):
+def evaluate_model(env, agent, num_runs=1, temperature=None):
     """
-    使用包含温度平滑的定制定向策略评估当前模型性能，并执行多次以取均值。
+    使用包含温度平滑的定制定向策略评估当前模型性能。
+    因当前评估环境与种子已完全固定（Deterministic），单次执行即可获得稳定基线。
     
     Returns:
         makespan (float): 多次运行均值最大完工时间 
@@ -81,6 +83,7 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
     balances = []
     rewards = []
     schedules = []
+    durations = []
     
     for _ in range(num_runs):
         # 验证场景绝对不可以使用任何数据扰乱！保证评估基线的绝对公平。
@@ -89,6 +92,7 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
         total_reward = 0
         device = agent.device
         
+        start_time = time.time()
         while not done:
             task_mask, station_mask, worker_mask = env.get_masks()
             
@@ -113,24 +117,33 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
                 task_mask = torch.ones_like(task_mask) # 强制触发下方的 deadlock 终局结算
                 break
                 
-            action, _, _, _ = action_ret
+            action, _, _, _, is_invalid = action_ret
+            
+            from configs import configs
+            if getattr(configs, 'ablation_no_mask', False) and is_invalid:
+                task_mask = torch.ones_like(task_mask) 
+                break
             
             state, reward, done, _ = env.step(action)
             total_reward += reward
             
+        end_time = time.time()
+        
         if task_mask.all():
             makespans.append(99999.0) # Matches GA's massive penalty
             balances.append(9999.0)
             rewards.append(total_reward - 10000.0)
             schedules.append([])
+            durations.append(end_time - start_time)
         else:
             makespans.append(np.max(env.station_wall_clock)) # [CRITICAL] True physical completion time!
             balances.append(np.std(env.station_loads))     # [Maintain] Use workloads for labor distribution stats
             rewards.append(total_reward)
             schedules.append(env.assigned_tasks)
+            durations.append(end_time - start_time)
         
     best_idx = np.argmin(makespans)
-    return np.mean(makespans), np.mean(balances), np.mean(rewards), schedules[best_idx]
+    return np.mean(makespans), np.mean(balances), np.mean(rewards), schedules[best_idx], np.mean(durations)
 
 # ---------------------------------------------------------------------------
 # 训练主循环
@@ -275,7 +288,7 @@ def train(args):
                      pass
                 
                 # 选择动作 (Stochastic with Annealed Temperature)
-                action, logprob, val, _ = agent.select_action(
+                action, logprob, val, _, is_invalid = agent.select_action(
                     state.to(device), 
                     mask_task=t_mask, 
                     mask_station_matrix=s_mask,
@@ -283,6 +296,22 @@ def train(args):
                     deterministic=False,
                     temperature=current_temp
                 )
+                
+                # [Phase 5: Ablation Soft Penalty]
+                from configs import configs
+                if getattr(configs, 'ablation_no_mask', False) and is_invalid:
+                     reward = -100.0  # Massive penalty for picking strictly invalid masked items
+                     done = True      # Terminate episode immediately to prevent infinite loops of illegal actions
+                     
+                     memory.states.append(env.get_state_snapshot()) 
+                     memory.actions.append(action)
+                     memory.logprobs.append(torch.tensor(logprob).to(device) if not isinstance(logprob, torch.Tensor) else logprob)
+                     memory.rewards.append(reward)
+                     memory.is_terminals.append(done)
+                     memory.masks.append((task_mask.cpu(), station_mask.cpu(), worker_mask.cpu()))
+                     memory.values.append(torch.tensor(val).to(device) if not isinstance(val, torch.Tensor) else val)
+                     ep_reward += reward
+                     break
                 
                 # 执行动作
                 next_state, reward, done, info = env.step(action)
@@ -322,21 +351,21 @@ def train(args):
                     writer.add_scalar(k, v, ep)
                 
             # 定期评估与保存
-            if ep % eval_freq == 0:
-                # 在训练过程中，使用较少的多轮评估 (如 3 轮)，带有极小温度 (如 0.0) 以检测绝对贪婪上线
-                makespan, balance, eval_reward, best_sch = evaluate_model(env, agent, num_runs=3, temperature=configs.eval_temperature)
+              # [Validation Strategy]
+            if ep % getattr(configs, 'eval_interval', 5) == 0:
+                makespan, balance, eval_reward, best_sch, eval_duration = evaluate_model(eval_env, agent, num_runs=1, temperature=configs.eval_temperature)
                 
-                print(f"[Eval] Ep {ep} | Avg Real-Makespan: {makespan:.1f} | Avg Workload-Balance_Std: {balance:.2f} | AvgReward: {eval_reward:.2f}")
+                print(f"Epoch {ep:04d} [EVAL] | Makespan: {makespan:.2f} \t| Balance Std: {balance:.2f} \t| Eval Reward: {eval_reward:.2f} \t| Latency: {eval_duration:.4f}s")
                 
                 writer.add_scalar('Eval/WallClock_Makespan', makespan, ep)
                 writer.add_scalar('Eval/Workload_Balance_Std', balance, ep)
                 writer.add_scalar('Eval/Average_Return', eval_reward, ep)
+                writer.add_scalar('Eval/Inference_Time_sec', eval_duration, ep)
                 
                 # Save Latest
                 torch.save({
                     'episode': ep,
                     'model_state_dict': agent.policy.state_dict(),
-                    'optimizer_state_dict': agent.optimizer.state_dict(),
                 }, checkpoint_path)
                 
                 # Save Best
@@ -384,30 +413,34 @@ def train(args):
         print("\n>>> [1/2] 开始执行 PPO Agent 的终局推演...")
         # 重新实例环境，避免脏数据
         eval_env = AirLineEnv_Graph(data_path=data_path, seed=2026)
-        ppo_makespan, ppo_balance, _, ppo_assigned = evaluate_model(eval_env, agent, num_runs=5, temperature=configs.eval_temperature)
+        ppo_makespan, ppo_balance, _, ppo_assigned, ppo_duration = evaluate_model(eval_env, agent, num_runs=1, temperature=configs.eval_temperature)
         
         # 配置 GA 基准对抗
         print("\n>>> [2/2] 开始执行 Genetic Algorithm (GA) 基线推演...")
         ga_env = AirLineEnv_Graph(data_path=data_path, seed=2026)
         ga_scheduler = GeneticAlgorithmScheduler(ga_env, pop_size=30, max_gen=20)
+        ga_start = time.time()
         ga_makespan, ga_balance, ga_assigned = ga_scheduler.run()
+        ga_duration = time.time() - ga_start
         
         # --- 报表总结生成 ---
-        print("\n" + "#"*50)
+        print("\n" + "#"*60)
         print("🚀 终局对比结果报告 (PPO vs GA) 🚀")
-        print(f"指标说明：Makespan (越小越好), Balance (越小越好)")
-        print("-"*50)
-        print(f"| 模型算法类型          | Makespan (h) | Balance Std |")
-        print(f"|-----------------------|--------------|-------------|")
-        print(f"| 经典运筹学: (GA 基线) | {ga_makespan:12.2f} | {ga_balance:11.2f} |")
-        print(f"| 强化学习: (HB-GAT-PN) | {ppo_makespan:12.2f} | {ppo_balance:11.2f} |")
-        print("#"*50 + "\n")
+        print(f"指标说明：Makespan/Balance (越小越好), 推理耗时 (越快越好)")
+        print("-" * 60)
+        print(f"| 模型算法类型          | Makespan (h) | Balance Std | 推理耗时 (秒) |")
+        print(f"|-----------------------|--------------|-------------|---------------|")
+        print(f"| 经典运筹学: (GA 基线) | {ga_makespan:12.2f} | {ga_balance:11.2f} | {ga_duration:13.4f} |")
+        print(f"| 强化学习: (HB-GAT-PN) | {ppo_makespan:12.2f} | {ppo_balance:11.2f} | {ppo_duration:13.4f} |")
+        print("#"*60 + "\n")
         
-        # 导出最佳 PPO 细节到 CSV 及画图
-        output_dir = "results"
-        os.makedirs(output_dir, exist_ok=True)
+        # 导出最佳 PPO 与 GA 细节到各自的文件夹及画图
+        output_dir_ppo = os.path.join("results", "PPO")
+        output_dir_ga = os.path.join("results", "GA")
+        os.makedirs(output_dir_ppo, exist_ok=True)
+        os.makedirs(output_dir_ga, exist_ok=True)
         
-        def save_schedule(tasks, prefix_name):
+        def save_schedule(tasks, prefix_name, target_dir):
             if not tasks: return
             tasks_data = []
             for (tid, sid, team, start, end) in tasks:
@@ -420,12 +453,12 @@ def train(args):
                      'Duration': end - start
                  })
             df = pd.DataFrame(tasks_data)
-            df.to_csv(os.path.join(output_dir, f"{prefix_name}_schedule.csv"), index=False)
-            plot_gantt(tasks, os.path.join(output_dir, f"{prefix_name}_gantt.png"))
+            df.to_csv(os.path.join(target_dir, f"{prefix_name}_schedule.csv"), index=False)
+            plot_gantt(tasks, os.path.join(target_dir, f"{prefix_name}_gantt.png"))
             
-        print(f"正在向目录 ./{output_dir} 保存排程细节与甘特图...")
-        save_schedule(ppo_assigned, "PPO_Final")
-        save_schedule(ga_assigned, "GA_Baseline")
+        print(f"正在向目录 ./results/PPO 与 ./results/GA 保存排程细节与甘特图...")
+        save_schedule(ppo_assigned, "PPO_Final", output_dir_ppo)
+        save_schedule(ga_assigned, "GA_Baseline", output_dir_ga)
         print("所有流程圆满结束！")
 
     except KeyboardInterrupt:
@@ -436,6 +469,17 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', action='store_true', help='Resume training from latest checkpoint')
+    
+    # [Phase 5: Ablation] 消融实验控制开关
+    parser.add_argument('--ablation_no_gat', action='store_true', help='Disable GAT layers (use raw features instead)')
+    parser.add_argument('--ablation_no_pointer', action='store_true', help='Disable Pointer Network (use simple linear match)')
+    parser.add_argument('--ablation_no_mask', action='store_true', help='Disable Hard Masking (use soft penalty constraint)')
+    
     args = parser.parse_args()
+    
+    # 动态写入 configs 对象，由于各处都会 import configs，可实现全局透传
+    setattr(configs, 'ablation_no_gat', args.ablation_no_gat)
+    setattr(configs, 'ablation_no_pointer', args.ablation_no_pointer)
+    setattr(configs, 'ablation_no_mask', args.ablation_no_mask)
     
     train(args)

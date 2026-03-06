@@ -95,6 +95,9 @@ class PPOAgent:
             state_value: float
             specific_station_mask: 用于 Memory 记录
         """
+        from configs import configs
+        no_mask = getattr(configs, 'ablation_no_mask', False)
+        
         with torch.no_grad():
             x_dict, global_context = self.policy(obs)
             
@@ -104,19 +107,19 @@ class PPOAgent:
             # ------------------
             # 1. 选择工序 (Select Task)
             # ------------------
-            task_logits = self.policy.task_head(x_dict['task'], global_context, mask=mask_task)
+            task_logits = self.policy.task_head(x_dict['task'], global_context, mask=mask_task if not no_mask else None)
             
             # [Robustness] 检查并处理 NaN
             if torch.isnan(task_logits).any():
                 task_logits = torch.nan_to_num(task_logits, nan=mask_value)
             
             if deterministic:
-                if mask_task is not None:
+                if mask_task is not None and not no_mask:
                     task_logits = task_logits.masked_fill(mask_task, mask_value)
                 task_action = torch.argmax(task_logits)
                 task_logprob = torch.tensor(0.0).to(self.device)
             else:
-                if mask_task is not None:
+                if mask_task is not None and not no_mask:
                      task_logits = task_logits.masked_fill(mask_task, mask_value)
                 
                 # Check for all -inf
@@ -148,18 +151,18 @@ class PPOAgent:
                 specific_station_mask = mask_station_matrix[t_idx].unsqueeze(0)
             
             station_embs = x_dict['station'].unsqueeze(0)
-            station_logits = self.policy.station_head(selected_task_emb, station_embs, mask=specific_station_mask)
+            station_logits = self.policy.station_head(selected_task_emb, station_embs, mask=specific_station_mask if not no_mask else None)
             
             if torch.isnan(station_logits).any():
                 station_logits = torch.nan_to_num(station_logits, nan=mask_value)
             
             if deterministic:
-                if specific_station_mask is not None:
+                if specific_station_mask is not None and not no_mask:
                      station_logits = station_logits.masked_fill(specific_station_mask, mask_value)
                 station_action = torch.argmax(station_logits)
                 station_logprob = torch.tensor(0.0).to(self.device)
             else:
-                if specific_station_mask is not None:
+                if specific_station_mask is not None and not no_mask:
                      station_logits = station_logits.masked_fill(specific_station_mask, mask_value)
                 
                 if (station_logits <= mask_value * 0.99).all():
@@ -209,13 +212,16 @@ class PPOAgent:
                     is_valuable_expert = workers_with_k & unlocked_mask 
                     preservation_mask = preservation_mask | is_valuable_expert.to(self.device)
             
-            # 试算：应用保护掩码后是否还有足够人手满足 demand
-            trial_mask = current_worker_mask | skill_mask.to(self.device) | lock_mask.to(self.device) | preservation_mask
-            if (~trial_mask).sum().item() >= demand:
-                current_worker_mask = trial_mask # 启用独苗保护
+            if no_mask:
+                current_worker_mask = skill_mask.to(self.device)
             else:
-                # 活儿干不完了，动用战略储备
-                current_worker_mask = current_worker_mask | skill_mask.to(self.device) | lock_mask.to(self.device)
+                # 试算：应用保护掩码后是否还有足够人手满足 demand
+                trial_mask = current_worker_mask | skill_mask.to(self.device) | lock_mask.to(self.device) | preservation_mask
+                if (~trial_mask).sum().item() >= demand:
+                    current_worker_mask = trial_mask # 启用独苗保护
+                else:
+                    # 活儿干不完了，动用战略储备
+                    current_worker_mask = current_worker_mask | skill_mask.to(self.device) | lock_mask.to(self.device)
             
             worker_embs = x_dict['worker'].unsqueeze(0)
             
@@ -236,13 +242,13 @@ class PPOAgent:
                     worker_logits = torch.nan_to_num(worker_logits, nan=mask_value)
                 
                 if deterministic:
-                     worker_logits = worker_logits.masked_fill(current_worker_mask, mask_value)
+                     if not no_mask: worker_logits = worker_logits.masked_fill(current_worker_mask, mask_value)
                      if (worker_logits <= mask_value * 0.99).all(): break
                      
                      w_action = torch.argmax(worker_logits)
                      w_lp = torch.tensor(0.0).to(self.device)
                 else:
-                     worker_logits = worker_logits.masked_fill(current_worker_mask, mask_value)
+                     if not no_mask: worker_logits = worker_logits.masked_fill(current_worker_mask, mask_value)
                      
                      if (worker_logits <= mask_value * 0.99).all():
                          break # 无法继续选人
