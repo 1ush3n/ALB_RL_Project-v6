@@ -77,7 +77,7 @@ class PPOAgent:
         else:
             self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
-    def select_action(self, obs, mask_task=None, mask_station_matrix=None, mask_worker=None, deterministic=False, temperature=1.0):
+    def select_action(self, obs, mask_task=None, mask_station_matrix=None, mask_worker=None, deterministic=False, temperature=1.0, is_eval=False):
         """
         选择动作 (Select Action)。
         
@@ -98,6 +98,9 @@ class PPOAgent:
         with torch.no_grad():
             x_dict, global_context = self.policy(obs)
             
+            # [Phase 1: Robustness] 获取动态适配的 dtype 极小值（防止 FP16 下 -1e9 溢出）
+            mask_value = torch.finfo(x_dict['task'].dtype).min / 2.0
+            
             # ------------------
             # 1. 选择工序 (Select Task)
             # ------------------
@@ -105,19 +108,19 @@ class PPOAgent:
             
             # [Robustness] 检查并处理 NaN
             if torch.isnan(task_logits).any():
-                task_logits = torch.nan_to_num(task_logits, nan=-1e9)
+                task_logits = torch.nan_to_num(task_logits, nan=mask_value)
             
             if deterministic:
                 if mask_task is not None:
-                    task_logits = task_logits.masked_fill(mask_task, -1e9)
+                    task_logits = task_logits.masked_fill(mask_task, mask_value)
                 task_action = torch.argmax(task_logits)
                 task_logprob = torch.tensor(0.0).to(self.device)
             else:
                 if mask_task is not None:
-                     task_logits = task_logits.masked_fill(mask_task, -1e9)
+                     task_logits = task_logits.masked_fill(mask_task, mask_value)
                 
                 # Check for all -inf
-                if (task_logits <= -1e8).all():
+                if (task_logits <= mask_value * 0.99).all():
                      print("WARNING: All Task Logits -inf in select_action. Force picking 0.")
                      task_action = torch.tensor(0).to(self.device)
                      task_logprob = torch.tensor(0.0).to(self.device)
@@ -148,18 +151,18 @@ class PPOAgent:
             station_logits = self.policy.station_head(selected_task_emb, station_embs, mask=specific_station_mask)
             
             if torch.isnan(station_logits).any():
-                station_logits = torch.nan_to_num(station_logits, nan=-1e9)
+                station_logits = torch.nan_to_num(station_logits, nan=mask_value)
             
             if deterministic:
                 if specific_station_mask is not None:
-                     station_logits = station_logits.masked_fill(specific_station_mask, -1e9)
+                     station_logits = station_logits.masked_fill(specific_station_mask, mask_value)
                 station_action = torch.argmax(station_logits)
                 station_logprob = torch.tensor(0.0).to(self.device)
             else:
                 if specific_station_mask is not None:
-                     station_logits = station_logits.masked_fill(specific_station_mask, -1e9)
+                     station_logits = station_logits.masked_fill(specific_station_mask, mask_value)
                 
-                if (station_logits <= -1e8).all():
+                if (station_logits <= mask_value * 0.99).all():
                      print("WARNING: All Station Logits -inf. Force picking 0.")
                      station_action = torch.tensor(0).to(self.device)
                      station_logprob = torch.tensor(0.0).to(self.device)
@@ -216,7 +219,13 @@ class PPOAgent:
             
             worker_embs = x_dict['worker'].unsqueeze(0)
             
-            for _ in range(demand):
+            # [Phase 1: Robustness] 加入迭代阈值和 Fallback 防止因掩码过度重叠发生死循环
+            max_iter = demand * 2
+            iter_cnt = 0
+            
+            while len(team_indices) < demand and iter_cnt < max_iter:
+                iter_cnt += 1
+                
                 # 还有可选工人吗?
                 if current_worker_mask.all():
                     break
@@ -224,18 +233,18 @@ class PPOAgent:
                 worker_logits = self.policy.worker_head.forward_choice(selected_task_emb, worker_embs, mask=current_worker_mask)
                 
                 if torch.isnan(worker_logits).any():
-                    worker_logits = torch.nan_to_num(worker_logits, nan=-1e9)
+                    worker_logits = torch.nan_to_num(worker_logits, nan=mask_value)
                 
                 if deterministic:
-                     worker_logits = worker_logits.masked_fill(current_worker_mask, -1e9)
-                     if (worker_logits <= -1e8).all(): break
+                     worker_logits = worker_logits.masked_fill(current_worker_mask, mask_value)
+                     if (worker_logits <= mask_value * 0.99).all(): break
                      
                      w_action = torch.argmax(worker_logits)
                      w_lp = torch.tensor(0.0).to(self.device)
                 else:
-                     worker_logits = worker_logits.masked_fill(current_worker_mask, -1e9)
+                     worker_logits = worker_logits.masked_fill(current_worker_mask, mask_value)
                      
-                     if (worker_logits <= -1e8).all():
+                     if (worker_logits <= mask_value * 0.99).all():
                          break # 无法继续选人
                      
                      if temperature != 1.0:
@@ -252,6 +261,28 @@ class PPOAgent:
                 # 更新 Mask (选过的人不能再选)
                 current_worker_mask = current_worker_mask.clone() # 确保不 原地修改 影响下一轮
                 current_worker_mask[w_idx] = True
+            
+            # [兜底逻辑] 若因过度竞争或死锁选不够人选
+            if len(team_indices) < demand:
+                if is_eval:
+                    # [Evaluation Strict Mode] 验证期间绝对不允许兜底作弊！
+                    # 如果选不够人，说明策略出现断层死锁，直接将失败上传以施加真实的验证集惩罚。
+                    return None, 0.0, 0.0, None
+                    
+                missing = demand - len(team_indices)
+                available_indices = torch.where(current_worker_mask == False)[0]
+                if len(available_indices) >= missing:
+                    team_indices.extend(available_indices[:missing].tolist())
+                    for _ in range(missing):
+                        worker_logprobs.append(torch.tensor(0.0).to(self.device))
+                else:
+                    # 如果连违规的也不够，就随便塞填充满（避免底层算子形状崩溃）
+                    all_indices = torch.arange(obs['worker'].num_nodes)
+                    fallback = all_indices[:missing].tolist()
+                    team_indices.extend(fallback)
+                    for _ in range(missing):
+                        worker_logprobs.append(torch.tensor(0.0).to(self.device))
+            
             
             total_worker_logprob = sum(worker_logprobs) if worker_logprobs else torch.tensor(0.0).to(self.device)
             
@@ -480,20 +511,35 @@ class PPOAgent:
                             
                 total_lp = task_lp + station_lp + team_lp
                 
+                # [Phase 2: LogProb Clipping] 防止后续的 torch.exp 发生指数散度爆炸
+                total_lp = torch.clamp(total_lp, min=-20.0, max=2.0)
+                
                 # --- PPO Loss Calculation ---
                 ratios = torch.exp(total_lp - batch.y_logprob.view(-1))
                 
                 # Use GAE advantages if available, else batch.y_reward - state_values (MC fallback)
                 b_adv = batch.y_advantage.view(-1) if hasattr(batch, 'y_advantage') else (batch.y_reward.view(-1) - state_values.detach())
                 
+                # [Phase 2: Batch-Level Advantage Normalization] 进一步压缩批次内方差
+                if b_adv.std() > 1e-5:
+                    b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
+                
+                # [Phase 2: Dynamic EPS Clip & Entropy Annealing] 动态衰减探索上限
+                progress = min(1.0, self.current_step / max(1, self.total_timesteps))
+                curr_eps_clip = self.eps_clip - progress * (self.eps_clip - 0.05)
+                
                 surr1 = ratios * b_adv
-                surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * b_adv
+                surr2 = torch.clamp(ratios, 1-curr_eps_clip, 1+curr_eps_clip) * b_adv
                 
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
                 # Value and Entropy Loss scaled by configs
                 c_val = getattr(configs, 'c_value', 0.5)
-                c_ent = getattr(configs, 'c_entropy', 0.01)
+                c_ent_base = getattr(configs, 'c_entropy', 0.01)
+                
+                # [Phase 2: Entropy Decay] 熵退火，随进程向贪婪坍缩
+                c_ent = c_ent_base * (1.0 - 0.9 * progress) 
+                
                 c_pol = getattr(configs, 'c_policy', 1.0)
                 
                 # [CRITICAL FIX: Huber Loss] 使用 Huber Loss 替代 MSE，当预测误差过大（如数千万）时线性回传梯度，防止 Critic 巨型梯度经 clip 后将 Policy 梯度抹零致盲

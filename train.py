@@ -17,6 +17,16 @@ from configs import configs
 import pandas as pd
 from baseline_ga import GeneticAlgorithmScheduler
 from utils.visualization import plot_gantt
+import random
+
+# [Phase 3: Seed Lock]
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # ---------------------------------------------------------------------------
 # 经验回放缓冲区 (Memory Buffer)
@@ -42,6 +52,12 @@ class Memory:
         del self.is_terminals[:]
         del self.masks[:]
         del self.values[:]
+        
+        # [Phase 3: Memory GC] 显式释放大图残余，防 OOM 内存泄漏
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 # ---------------------------------------------------------------------------
 # 评估函数
@@ -57,6 +73,9 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
     """
     if temperature is None:
         temperature = getattr(configs, 'eval_temperature', 0.0)
+        
+    # [Phase 1: Robustness] 评估期间必须关闭 Dropout 等影响确定性的结构
+    agent.policy.eval()
         
     makespans = []
     balances = []
@@ -79,14 +98,22 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
                 break
                 
             # 引入验证温度的动作选择
-            action, _, _, _ = agent.select_action(
+            action_ret = agent.select_action(
                 state.to(device), 
                 mask_task=task_mask.to(device), 
                 mask_station_matrix=station_mask.to(device),
                 mask_worker=worker_mask.to(device),
                 deterministic=(temperature == 0.0),
-                temperature=temperature
+                temperature=temperature,
+                is_eval=True
             )
+            
+            if action_ret[0] is None:
+                print(f"[Eval] Agent failed to form a valid team (Worker Deadlock). Returning max penalty.")
+                task_mask = torch.ones_like(task_mask) # 强制触发下方的 deadlock 终局结算
+                break
+                
+            action, _, _, _ = action_ret
             
             state, reward, done, _ = env.step(action)
             total_reward += reward
@@ -111,6 +138,10 @@ def evaluate_model(env, agent, num_runs=3, temperature=None):
 def train(args):
     try:
         print("--- 开始训练 (Starting Training) ---")
+        
+        # [Phase 3: Seed Lock] 接管顶层强化学习伪随机核心
+        seed_cfg = getattr(configs, 'seed', 42)
+        set_seed(seed_cfg)
         
         # 1. 初始化环境
         data_path = str(configs.data_file_path) if configs.data_file_path else "3000.csv"
@@ -191,6 +222,9 @@ def train(args):
         print(f"开始 Episode 循环 (Max: {max_episodes})...")
         
         for ep in range(start_episode, configs.max_episodes + 1):
+            
+            # [Phase 1: Robustness] 每轮迭代开始前强制恢复训练模式，开启 Dropout 等机制
+            agent.policy.train()
             
             # [Temperature Annealing] 计算当前环境的探索“温度”
             decay_ratio = min(1.0, (ep - 1) / max(1, getattr(configs, 'temp_decay_episodes', 2000)))
@@ -296,6 +330,7 @@ def train(args):
                 
                 writer.add_scalar('Eval/WallClock_Makespan', makespan, ep)
                 writer.add_scalar('Eval/Workload_Balance_Std', balance, ep)
+                writer.add_scalar('Eval/Average_Return', eval_reward, ep)
                 
                 # Save Latest
                 torch.save({

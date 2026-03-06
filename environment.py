@@ -51,8 +51,12 @@ class AirLineEnv_Graph(gym.Env):
     3. 复杂约束: 包含工艺优先关系、技能匹配、站位空间约束。
     """
     
-    def __init__(self, data_path="工序约束_50.xlsx", seed=None):
+    # [Phase 3: Engineering] Gymnasium Metadata
+    metadata = {"render_modes": ["human"], "render_fps": 10}
+    
+    def __init__(self, data_path="工序约束_50.xlsx", seed=None, render_mode=None):
         super().__init__()
+        self.render_mode = render_mode
         
         # 设置随机种子以保证环境复现性 (Determinism)
         # 这对于验证集评估至关重要
@@ -220,12 +224,17 @@ class AirLineEnv_Graph(gym.Env):
         self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 9))], dim=1)
         self.base_station_x = torch.zeros((self.num_stations, 12))
         
-    def reset(self, randomize_duration=False, randomize_workers=False):
+    def reset(self, randomize_duration=False, randomize_workers=False, seed=None, options=None):
         """
         重置环境状态以开始新的 Episode。
         如果在训练阶段开启 randomize_duration，则按 ±range 对静态工时进行伪装修改。
         如果在训练阶段开启 randomize_workers，则动态随机抽取固定工人池的一个子集（领域随机化）。
         """
+        # [Phase 3: Engineering] Gymnasium seed forward compatibility
+        super().reset(seed=seed, options=options)
+        if seed is not None:
+             np.random.seed(seed)
+             
         # ====================
         # [Domain Randomization] Worker Pool Sampling
         # ====================
@@ -549,6 +558,9 @@ class AirLineEnv_Graph(gym.Env):
         # 将原有的 terminal 扣除分摊到每一步的改变中
         reward -= (coef_makespan * delta_makespan) + (coef_std * delta_std)
         
+        # [Phase 2: Reward Clipping] 单步奖励硬截断，防止梯度极值爆炸
+        reward = np.clip(reward, -10.0, 10.0)
+        
         # F. 终局结算 (Final Cleansing)
         done = (len(self.assigned_tasks) == self.num_tasks)
         
@@ -565,6 +577,18 @@ class AirLineEnv_Graph(gym.Env):
            - 如果无 -> 跳跃到下一个事件发生的时间点。
         """
         while True:
+            # [Phase 1: Robustness] 增加队列非空与异常容量断言防护
+            if not self.event_queue:
+                self.current_time = self.max_time
+                # Queue empty means simulation ends
+                return
+            
+            if len(self.event_queue) > 10000:
+                print("WARNING: Event queue limit exceeded! Forcing episode end to prevent OOM/Infinite Loop.")
+                self.current_time = self.max_time
+                self.event_queue = []
+                return
+                
             # 1. 处理所有已到期的事件
             while self.event_queue and self.event_queue[0].time <= self.current_time + 1e-5:
                 ev = heapq.heappop(self.event_queue)
