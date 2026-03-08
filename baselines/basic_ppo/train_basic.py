@@ -266,8 +266,7 @@ def train_basic_ppo(args):
             # 记录指标
             episode_rewards.append(ep_reward)
             
-            task_mask, _, _ = env.get_masks()
-            makespan = np.max(env.station_wall_clock) if not task_mask.all() else 99999.0
+            makespan = np.max(env.station_wall_clock) if len(env.assigned_tasks) == env.num_tasks else 99999.0
             episode_makespans.append(makespan)
             
             loss = agent.update(batch_size)

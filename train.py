@@ -128,7 +128,7 @@ def evaluate_model(env, agent, num_runs=1, temperature=None):
             
         end_time = time.time()
         
-        if task_mask.all():
+        if len(env.assigned_tasks) != env.num_tasks:
             makespans.append(99999.0) # Matches GA's massive penalty
             balances.append(9999.0)
             rewards.append(total_reward - 10000.0)
@@ -245,8 +245,13 @@ def train(args):
             decay_ratio = min(1.0, (ep - 1) / max(1, getattr(configs, 'temp_decay_episodes', 2000)))
             current_temp = getattr(configs, 'temp_start', 2.0) - decay_ratio * (getattr(configs, 'temp_start', 2.0) - getattr(configs, 'temp_end', 0.1))
             
-            # [Domain Randomization] 如果配置开启泛化性抗干扰，则给环境施加动态工时噪音
+            # [Phase 4: Curriculum Learning] 课程式学习 (缓解初期 Critic 震荡)
+            # 训练前期关闭随机时间与技能波动，给网络一个稳定的静态拟合期
+            curr_curriculum_episodes = getattr(configs, 'curriculum_episodes', 500)
             apply_noise = getattr(configs, 'randomize_durations', False)
+            if ep <= curr_curriculum_episodes:
+                apply_noise = False
+                
             state = env.reset(randomize_duration=apply_noise, randomize_workers=apply_noise)
             
             done = False

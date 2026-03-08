@@ -196,8 +196,7 @@ def train_dqn(args):
             episode_rewards.append(ep_reward)
             episode_losses.append(ep_loss / step_count if step_count > 0 else 0)
             
-            task_mask, _, _ = env.get_masks()
-            makespan = np.max(env.station_wall_clock) if not task_mask.all() else 99999.0
+            makespan = np.max(env.station_wall_clock) if len(env.assigned_tasks) == env.num_tasks else 99999.0
             episode_makespans.append(makespan)
             
             # 每10轮打印日志

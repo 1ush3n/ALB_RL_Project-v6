@@ -37,6 +37,7 @@ class configs:
     # ------------------
     randomize_durations = True      # 是否在训练期间开启工时随机扰动
     dur_random_range = 0.2          # 工时扰动幅度 (0.2 表示基础工时的 ±20% 波动)
+    curriculum_episodes = 500       # [课程式学习] 训练前 N 轮强制关闭所有随机因子，稳定 Critic 拟合
     
     # ------------------
     # PPO 训练超参数 (PPO Training)

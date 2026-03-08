@@ -559,9 +559,18 @@ class PPOAgent:
                 
                 c_pol = getattr(configs, 'c_policy', 1.0)
                 
-                # [CRITICAL FIX: Huber Loss] 使用 Huber Loss 替代 MSE，当预测误差过大（如数千万）时线性回传梯度，防止 Critic 巨型梯度经 clip 后将 Policy 梯度抹零致盲
+                # [CRITICAL FIX: Huber Loss & Value Clipping]
                 b_reward = batch.y_reward.view(-1)
-                value_loss = c_val * torch.nn.functional.huber_loss(state_values, b_reward, delta=10.0)
+                
+                if hasattr(batch, 'y_value'):
+                    old_values = batch.y_value.view(-1).to(self.device)
+                    # Critic 价值追踪裁剪，防止一次更新步伐过大导致网络崩塌
+                    v_clipped = old_values + torch.clamp(state_values - old_values, -curr_eps_clip, curr_eps_clip)
+                    loss1 = torch.nn.functional.huber_loss(state_values, b_reward, delta=10.0, reduction='none')
+                    loss2 = torch.nn.functional.huber_loss(v_clipped, b_reward, delta=10.0, reduction='none')
+                    value_loss = c_val * torch.max(loss1, loss2).mean()
+                else:
+                    value_loss = c_val * torch.nn.functional.huber_loss(state_values, b_reward, delta=10.0)
                      
                 entropy_loss = -c_ent * entropy.mean()
                 

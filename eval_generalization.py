@@ -44,18 +44,21 @@ def run_generalization(args):
     env = AirLineEnv_Graph(data_path=test_data, seed=2026)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    from models.hb_gat_pn import HBGATPN
+    model = HBGATPN(configs).to(device)
+    
     agent = PPOAgent(
-        obs_dim=0, # unused in dynamic GAT node feature
-        action_dim=0, 
-        device=device,
+        model=model,
         lr=getattr(configs, 'lr', 1e-4),
         gamma=getattr(configs, 'gamma', 0.99),
-        clip_epsilon=getattr(configs, 'clip_epsilon', 0.2),
-        c1=getattr(configs, 'c1', 0.5),
-        c2=getattr(configs, 'c2', 0.01),
-        using_muon=getattr(configs, 'use_muon', False),
-        min_lr=getattr(configs, 'min_lr', 1e-6),
-        total_steps=1 # Not training
+        k_epochs=getattr(configs, 'k_epochs', 4),
+        eps_clip=getattr(configs, 'clip_epsilon', 0.2),
+        device=device,
+        batch_size=getattr(configs, 'batch_size', 4),
+        lr_warmup_steps=0,
+        min_lr=0,
+        total_timesteps=1 # Not training
     )
     
     # Load Weights
