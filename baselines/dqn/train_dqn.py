@@ -17,6 +17,7 @@ from args_parser import get_dqn_parser
 from env_wrapper import init_env, standardize_env_reset, standardize_env_step, extract_flat_state_for_baselines
 from utils.logger import init_logger, record_experiment_time
 from utils.device_utils import get_available_device, clear_torch_cache
+from utils.visualization import plot_gantt
 
 # DQN网络（适配环境MultiDiscrete动作空间）
 class DQN(nn.Module):
@@ -59,29 +60,99 @@ class DQNAgent:
         
     def select_action(self, state, env_for_demand=None):
         """
-        带探索的动作选择，适配MultiDiscrete动作空间
+        带探索的动作选择，适配MultiDiscrete动作空间 (Cascaded Masking)
         """
         if np.random.rand() <= self.epsilon:
-            # 随机动作（探索）
-            task = np.random.randint(0, self.action_dim_list[0])
-            station = np.random.randint(0, self.action_dim_list[1])
-            worker = np.random.randint(0, self.action_dim_list[2])
+            # 随探索，强制联级拓扑合法
+            if env_for_demand is not None:
+                t_mask_raw, s_mask_raw, w_mask_global = env_for_demand.get_masks()
+                
+                # 1. Random Task
+                t_valid = torch.where(~t_mask_raw)[0].cpu().numpy()
+                if len(t_valid) == 0: return None # TOTAL DEADLOCK
+                task = int(np.random.choice(t_valid))
+                
+                # 2. Random Station strictly relying on Task
+                s_mask_t = s_mask_raw[task].cpu().numpy()
+                s_valid = np.where(~s_mask_t)[0]
+                station = int(np.random.choice(s_valid)) if len(s_valid) > 0 else 0
+                
+                # 3. Random Worker strictly relying on Task & Station
+                req_skill = int(env_for_demand.task_static_feat[task, 1].item())
+                worker_skills = env_for_demand.worker_skill_matrix.numpy()
+                has_skill = worker_skills[:, req_skill] > 0.5
+                worker_locks = env_for_demand.worker_locks
+                valid_lock = (worker_locks == 0) | (worker_locks == station + 1)
+                
+                final_w_mask_np = w_mask_global.numpy() | (~has_skill) | (~valid_lock)
+                w_valid = np.where(~final_w_mask_np)[0].tolist()
+                worker = int(np.random.choice(w_valid)) if len(w_valid) > 0 else 0
+                
+                demand = int(env_for_demand.task_static_feat[task, 2].item())
+                demand = max(1, demand)
+                team = [worker]
+                if demand > 1:
+                    subs = [w for w in w_valid if w != worker]
+                    team.extend(subs[:demand-1])
+            else:
+                task = np.random.randint(0, self.action_dim_list[0])
+                station = np.random.randint(0, self.action_dim_list[1])
+                worker = np.random.randint(0, self.action_dim_list[2])
+                team = [worker]
         else:
             # 贪心动作（利用）
             state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 task_logits, station_logits, worker_logits = self.model(state_tensor)
-                task = torch.argmax(task_logits).item()
-                station = torch.argmax(station_logits).item()
-                worker = torch.argmax(worker_logits).item()
                 
-        # To avoid ValueError unpacking in env.step due to list size
-        if env_for_demand is not None:
-             demand = int(env_for_demand.task_static_feat[task, 2].item())
-             demand = max(1, demand)
-             team = [abs(worker + i) % self.action_dim_list[2] for i in range(demand)]
-        else:
-             team = [worker]
+                # [Deadlock Prevent] Cascaded Action Masking
+                if env_for_demand is not None:
+                    t_mask_raw, s_mask_raw, w_mask_global = env_for_demand.get_masks()
+                    
+                    # 1. Mask Task
+                    t_mask = t_mask_raw.to(self.device).bool().unsqueeze(0)
+                    if t_mask.all(): return None # TOTAL DEADLOCK
+                    
+                    task_logits = task_logits.masked_fill(t_mask, -1e9)
+                    task = torch.argmax(task_logits).item()
+                    
+                    # 2. Mask Station conditioned on Task
+                    s_mask = s_mask_raw[task].to(self.device).bool().unsqueeze(0)
+                    station_logits = station_logits.masked_fill(s_mask, -1e9)
+                    station = torch.argmax(station_logits).item()
+                    
+                    # 3. Mask Worker conditioned on Task & Station
+                    req_skill = int(env_for_demand.task_static_feat[task, 1].item())
+                    worker_skills = env_for_demand.worker_skill_matrix.numpy()
+                    has_skill = worker_skills[:, req_skill] > 0.5
+                    
+                    worker_locks = env_for_demand.worker_locks
+                    valid_lock = (worker_locks == 0) | (worker_locks == station + 1)
+                    
+                    final_w_mask_np = w_mask_global.numpy() | (~has_skill) | (~valid_lock)
+                    w_mask = torch.tensor(final_w_mask_np, dtype=torch.bool).to(self.device).unsqueeze(0)
+                    
+                    worker_logits = worker_logits.masked_fill(w_mask, -1e9)
+                    worker = torch.argmax(worker_logits).item()
+                    
+                    demand = int(env_for_demand.task_static_feat[task, 2].item())
+                    demand = max(1, demand)
+                    team = [worker]
+                    if demand > 1:
+                        w_valid = np.where(~final_w_mask_np)[0].tolist()
+                        subs = [w for w in w_valid if w != worker]
+                        team.extend(subs[:demand-1])
+                        
+                    if t_mask_raw[task].item() == True or s_mask_raw[task, station].item() == True:
+                        print(f"CRITICAL: DQN Forced Invalid Action! Task={task}, Station={station}, Team={team}")
+                        
+                    
+                else:
+                    task = torch.argmax(task_logits).item()
+                    station = torch.argmax(station_logits).item()
+                    worker = torch.argmax(worker_logits).item()
+                    team = [worker]
+                
         return (task, station, team)
     
     def remember(self, state, action, reward, next_state, done):
@@ -178,6 +249,7 @@ def train_dqn(args):
         episode_rewards = []
         episode_losses = []
         episode_makespans = []
+        best_makespan = float('inf')
         
         # 训练循环
         logger.info(f"开始 DQN 训练，状态维度: {state_dim}，动作维度: {action_dim_list}，最大轮次: {args.max_episodes}")
@@ -194,6 +266,15 @@ def train_dqn(args):
                 step_count += 1
                 # 选择动作
                 action = agent.select_action(state, env_for_demand=env)
+                
+                if action is None:
+                    # [Deadlock Intercept] Environment is totally locked due to bad prior choices. Abort immediately.
+                    reward = -100.0
+                    done = True
+                    agent.remember(state, (0, 0, [0]), reward, state, done)
+                    ep_reward += reward
+                    break
+                    
                 # 执行动作
                 _, reward, done, info = standardize_env_step(env, action)
                 next_state = extract_flat_state_for_baselines(env)
@@ -214,6 +295,25 @@ def train_dqn(args):
             
             makespan = np.max(env.station_wall_clock) if len(env.assigned_tasks) == env.num_tasks else 99999.0
             episode_makespans.append(makespan)
+            
+            if makespan < best_makespan and len(env.assigned_tasks) == env.num_tasks:
+                best_makespan = makespan
+                best_sch = env.assigned_tasks.copy()
+                # 存储最新最好成绩的 CSV 和 Gantt
+                tasks_data = []
+                for (tid, sid, team, start, end) in best_sch:
+                     tasks_data.append({
+                         'TaskID': tid,
+                         'StationID': sid + 1,
+                         'Team': str(team),
+                         'Start': start,
+                         'End': end,
+                         'Duration': end - start
+                     })
+                df = pd.DataFrame(tasks_data)
+                df.to_csv(os.path.join(exp_dir, f"Best_Schedule_DQN.csv"), index=False)
+                plot_gantt(best_sch, os.path.join(exp_dir, f"Best_Gantt_DQN.png"))
+                logger.info(f"✨ 新的最佳 DQN 调度已保存! Makespan: {best_makespan:.2f} -> {exp_dir}")
             
             # 每10轮打印日志
             if (ep + 1) % 10 == 0:

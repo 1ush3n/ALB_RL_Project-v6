@@ -17,6 +17,7 @@ from args_parser import get_basic_ppo_parser
 from env_wrapper import init_env, standardize_env_reset, standardize_env_step, extract_flat_state_for_baselines
 from utils.logger import init_logger, record_experiment_time
 from utils.device_utils import get_available_device, clear_torch_cache
+from utils.visualization import plot_gantt
 
 # 基础PPO网络（仅MLP，无GAT/指针网络）
 class BasicPPO(nn.Module):
@@ -66,6 +67,7 @@ class BasicPPOAgent:
         self.rewards = []
         self.values = []
         self.dones = []
+        self.masks = []
     
     def select_action(self, state, env_for_demand=None):
         """
@@ -75,28 +77,75 @@ class BasicPPOAgent:
         with torch.no_grad():
             task_logits, station_logits, worker_logits, value = self.model(state_tensor)
             
-            # 构建分类分布
-            task_dist = Categorical(logits=task_logits)
-            station_dist = Categorical(logits=station_logits)
-            worker_dist = Categorical(logits=worker_logits)
-            
-            # 采样动作
-            task_action = task_dist.sample()
-            station_action = station_dist.sample()
-            worker_action = worker_dist.sample()
+            # [Deadlock Prevent] Cascaded Action Masking
+            if env_for_demand is not None:
+                t_mask_raw, s_mask_raw, w_mask_global = env_for_demand.get_masks()
+                
+                # 1. Mask Task
+                t_mask = t_mask_raw.to(self.device).bool().unsqueeze(0)
+                if t_mask.all(): return None # TOTAL DEADLOCK
+                
+                task_logits = task_logits.masked_fill(t_mask, -1e9)
+                task_dist = Categorical(logits=task_logits)
+                task_action = task_dist.sample()
+                task_idx = task_action.item()
+                
+                # 2. Mask Station (Conditioned strictly on chosen task)
+                s_mask = s_mask_raw[task_idx].to(self.device).bool().unsqueeze(0)
+                station_logits = station_logits.masked_fill(s_mask, -1e9)
+                station_dist = Categorical(logits=station_logits)
+                station_action = station_dist.sample()
+                station_idx = station_action.item()
+                
+                # 3. Mask Worker (Conditioned strictly on Task's Skill & Station's Lock)
+                req_skill = int(env_for_demand.task_static_feat[task_idx, 1].item())
+                worker_skills = env_for_demand.worker_skill_matrix.numpy()
+                has_skill = worker_skills[:, req_skill] > 0.5
+                
+                worker_locks = env_for_demand.worker_locks
+                valid_lock = (worker_locks == 0) | (worker_locks == station_idx + 1)
+                
+                w_mask_time = w_mask_global.numpy()
+                final_w_mask_np = w_mask_time | (~has_skill) | (~valid_lock)
+                w_mask = torch.tensor(final_w_mask_np, dtype=torch.bool).to(self.device).unsqueeze(0)
+                
+                worker_logits = worker_logits.masked_fill(w_mask, -1e9)
+                worker_dist = Categorical(logits=worker_logits)
+                worker_action = worker_dist.sample()
+                
+                mask_record = (t_mask, s_mask, w_mask)
+            else:
+                task_dist = Categorical(logits=task_logits)
+                station_dist = Categorical(logits=station_logits)
+                worker_dist = Categorical(logits=worker_logits)
+                task_action = task_dist.sample()
+                station_action = station_dist.sample()
+                worker_action = worker_dist.sample()
+                task_idx = task_action.item()
+                mask_record = None
             
             # 记录log prob和value
             log_prob = task_dist.log_prob(task_action) + station_dist.log_prob(station_action) + worker_dist.log_prob(worker_action)
             value = value.item()
         
         task_idx = task_action.item()
+        worker_idx = worker_action.item()
         
         if env_for_demand is not None:
-             demand = int(env_for_demand.task_static_feat[task_idx, 2].item())
-             demand = max(1, demand)
-             team = [abs(worker_action.item() + i) % self.action_dim_list[2] for i in range(demand)]
+            demand = int(env_for_demand.task_static_feat[task_idx, 2].item())
+            demand = max(1, demand)
+            team = [worker_idx]
+            if demand > 1:
+                if mask_record is not None:
+                    # Retrieve the global valid worker mask calculated in the cascaded phase
+                    final_w_mask_np = mask_record[2].cpu().numpy()[0]
+                    w_valid = np.where(~final_w_mask_np)[0].tolist()
+                    subs = [w for w in w_valid if w != worker_idx]
+                    team.extend(subs[:demand-1])
+                else:
+                    team = [abs(worker_idx + i) % self.action_dim_list[2] for i in range(demand)]
         else:
-             team = [worker_action.item()]
+             team = [worker_idx]
              
         action = (task_idx, station_action.item(), team)
         
@@ -107,6 +156,7 @@ class BasicPPOAgent:
         self.actions.append(recorded_action)
         self.log_probs.append(log_prob)
         self.values.append(value)
+        self.masks.append(mask_record)
         
         return action
     
@@ -166,6 +216,17 @@ class BasicPPOAgent:
                 # 前向传播
                 task_logits, station_logits, worker_logits, values = self.model(states[batch_idx])
                 
+                # 应用存储的合法性掩码重建相同概率约束
+                batch_masks = [self.masks[i] for i in batch_idx]
+                if batch_masks[0] is not None:
+                    t_masks = torch.cat([m[0] for m in batch_masks], dim=0)
+                    s_masks = torch.cat([m[1] for m in batch_masks], dim=0)
+                    w_masks = torch.cat([m[2] for m in batch_masks], dim=0)
+                    
+                    task_logits = task_logits.masked_fill(t_masks, -1e9)
+                    station_logits = station_logits.masked_fill(s_masks, -1e9)
+                    worker_logits = worker_logits.masked_fill(w_masks, -1e9)
+                
                 # 重新计算动作概率
                 task_dist = Categorical(logits=task_logits)
                 station_dist = Categorical(logits=station_logits)
@@ -212,6 +273,7 @@ class BasicPPOAgent:
         self.rewards.clear()
         self.values.clear()
         self.dones.clear()
+        self.masks.clear()
 
 def train_basic_ppo(args):
     # 初始化日志
@@ -239,6 +301,7 @@ def train_basic_ppo(args):
         episode_rewards = []
         episode_losses = []
         episode_makespans = []
+        best_makespan = float('inf')
         
         logger.info(f"开始 Basic PPO (MLP) 训练，状态维度: {state_dim}，动作维度: {action_dim_list}，最大轮次: {args.max_episodes}")
         for ep in range(args.max_episodes):
@@ -255,6 +318,14 @@ def train_basic_ppo(args):
                 
                 action = agent.select_action(state, env_for_demand=env)
                 
+                if action is None:
+                    # [Deadlock Intercept] Environment is totally locked. Abort immediately.
+                    reward = -100.0
+                    done = True
+                    agent.store_reward(reward, done)
+                    ep_reward += reward
+                    break
+                    
                 _, reward, done, info = standardize_env_step(env, action)
                 next_state = extract_flat_state_for_baselines(env)
                 
@@ -268,6 +339,25 @@ def train_basic_ppo(args):
             
             makespan = np.max(env.station_wall_clock) if len(env.assigned_tasks) == env.num_tasks else 99999.0
             episode_makespans.append(makespan)
+            
+            if makespan < best_makespan and len(env.assigned_tasks) == env.num_tasks:
+                best_makespan = makespan
+                best_sch = env.assigned_tasks.copy()
+                # 存储最新最好成绩的 CSV 和 Gantt
+                tasks_data = []
+                for (tid, sid, team, start, end) in best_sch:
+                     tasks_data.append({
+                         'TaskID': tid,
+                         'StationID': sid + 1,
+                         'Team': str(team),
+                         'Start': start,
+                         'End': end,
+                         'Duration': end - start
+                     })
+                df = pd.DataFrame(tasks_data)
+                df.to_csv(os.path.join(exp_dir, f"Best_Schedule_BasicPPO.csv"), index=False)
+                plot_gantt(best_sch, os.path.join(exp_dir, f"Best_Gantt_BasicPPO.png"))
+                logger.info(f"✨ 新的最佳 BasicPPO 调度已保存! Makespan: {best_makespan:.2f} -> {exp_dir}")
             
             loss = agent.update(batch_size)
             episode_losses.append(loss)
