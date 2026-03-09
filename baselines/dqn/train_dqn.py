@@ -89,52 +89,68 @@ class DQNAgent:
     
     def replay(self, batch_size):
         """
-        经验回放，分批训练避免内存溢出
+        经验回放，分批训练避免内存溢出 (Refactored for Vectorization & Safety)
         """
         if len(self.memory) < batch_size:
             return 0.0
         
         batch_indices = np.random.choice(len(self.memory), batch_size, replace=False)
-        losses = []
         
-        # 为了高效，可以将这里向量化。现在先用最稳妥的逐条计算
-        for idx in batch_indices:
-            state, action, reward, next_state, done = self.memory[idx]
+        # 批量解包 (Unzip)
+        batch = [self.memory[idx] for idx in batch_indices]
+        states, actions, rewards, next_states, dones = zip(*batch)
+        
+        # 转换为张量
+        state_tensor = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
+        next_state_tensor = torch.tensor(np.array(next_states), dtype=torch.float32).to(self.device)
+        reward_tensor = torch.tensor(np.array(rewards), dtype=torch.float32).to(self.device)
+        done_tensor = torch.tensor(np.array(dones), dtype=torch.float32).to(self.device)
+        
+        # [安全补丁: 维度断言] 防止因为异构环境抽出错误长度导致的隐性跑乱，这是避免静默失败的终极防御
+        expected_state_dim = self.model.fc1.in_features
+        assert state_tensor.shape == (batch_size, expected_state_dim), f"State shape mismatch: {state_tensor.shape} != {(batch_size, expected_state_dim)}"
+        
+        # 批量取得 actions (Task, Station, WorkerLeader)
+        task_a = torch.tensor([a[0] for a in actions], dtype=torch.long).to(self.device)
+        station_a = torch.tensor([a[1] for a in actions], dtype=torch.long).to(self.device)
+        worker_a = torch.tensor([a[2][0] for a in actions], dtype=torch.long).to(self.device) # Only consider leader
+        
+        # 当前Q值预测 (Batched)
+        task_logits, station_logits, worker_logits = self.model(state_tensor)
+        
+        # 提取被选中动作的 Q 值
+        batch_idx = torch.arange(batch_size, device=self.device)
+        q_task = task_logits[batch_idx, task_a]
+        q_station = station_logits[batch_idx, station_a]
+        q_worker = worker_logits[batch_idx, worker_a]
+        
+        q_current = (q_task + q_station + q_worker) / 3.0
+        
+        # 目标网络计算目标Q值 (Batched)
+        with torch.no_grad():
+            next_task_logits, next_station_logits, next_worker_logits = self.target_model(next_state_tensor)
+            # 取最大 Q 值
+            next_q_task = next_task_logits.max(dim=1)[0]
+            next_q_station = next_station_logits.max(dim=1)[0]
+            next_q_worker = next_worker_logits.max(dim=1)[0]
+            next_q = (next_q_task + next_q_station + next_q_worker) / 3.0
             
-            # 转换为tensor
-            state_tensor = torch.tensor(state, dtype=torch.float32).to(self.device)
-            next_state_tensor = torch.tensor(next_state, dtype=torch.float32).to(self.device)
-            reward_tensor = torch.tensor(reward, dtype=torch.float32).to(self.device)
-            
-            # 当前Q值
-            task_logits, station_logits, worker_logits = self.model(state_tensor)
-            task_a, station_a, team_a = action
-            leader_a = team_a[0]
-            q_current = (task_logits[task_a] + station_logits[station_a] + worker_logits[leader_a]) / 3.0
-            
-            # 目标Q值
-            if done:
-                q_target = reward_tensor
-            else:
-                with torch.no_grad():
-                    next_task_logits, next_station_logits, next_worker_logits = self.target_model(next_state_tensor)
-                    next_q = (torch.max(next_task_logits) + torch.max(next_station_logits) + torch.max(next_worker_logits)) / 3.0
-                q_target = reward_tensor + self.gamma * next_q
-            
-            # 计算损失
-            loss = self.loss_fn(q_current, q_target)
-            losses.append(loss.item())
-            
-            # 反向传播
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+        # 只有 not done 的部分才会累加 next_q
+        q_target = reward_tensor + self.gamma * next_q * (1 - done_tensor)
+        
+        # 计算全局损失
+        loss = self.loss_fn(q_current, q_target)
+        
+        # 全局一次反向传播
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
         
         # 衰减探索率
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
         
-        return np.mean(losses) if losses else 0.0
+        return loss.item()
 
 def train_dqn(args):
     # 初始化日志

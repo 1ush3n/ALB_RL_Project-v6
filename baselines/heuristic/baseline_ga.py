@@ -7,7 +7,10 @@ import argparse
 import sys
 import os
 
-# (Removed hardcoded sys.path.append to comply with standard project struct)
+# 动态添加根目录，以便导入环境和配置模块
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(os.path.dirname(current_dir))
+sys.path.append(parent_dir)
 
 from environment import AirLineEnv_Graph
 from configs import configs
@@ -92,6 +95,12 @@ class GeneticAlgorithmScheduler:
         stations = individual['station']
         team_prefs = np.array(individual['team_pref'])
         
+        # [安全补丁: 强制标量化/NumPy化]
+        # 把底层可能返回的多维 Tensor 全部降维剥离成纯净的 numpy array，以此彻底免疫类型混合运算导致的致命报错
+        worker_skill_matrix = sim_env.worker_skill_matrix.numpy() if hasattr(sim_env.worker_skill_matrix, 'numpy') else sim_env.worker_skill_matrix
+        worker_locks = sim_env.worker_locks.numpy() if hasattr(sim_env.worker_locks, 'numpy') else sim_env.worker_locks
+        task_static_feat = sim_env.task_static_feat.numpy() if hasattr(sim_env.task_static_feat, 'numpy') else sim_env.task_static_feat
+        
         # 将工序排队转化为优先级字典 (排在越前面优先级数值越高)
         priority_map = {task_id: (self.num_tasks - idx) for idx, task_id in enumerate(seq)}
         
@@ -105,7 +114,10 @@ class GeneticAlgorithmScheduler:
         
         while not done and step < max_limit:
             step += 1
-            t_mask, s_mask, w_mask = sim_env.get_masks()
+            t_mask_raw, s_mask_raw, w_mask_raw = sim_env.get_masks()
+            t_mask = t_mask_raw.numpy() if hasattr(t_mask_raw, 'numpy') else t_mask_raw
+            s_mask = s_mask_raw.numpy() if hasattr(s_mask_raw, 'numpy') else s_mask_raw
+            w_mask = w_mask_raw.numpy() if hasattr(w_mask_raw, 'numpy') else w_mask_raw
             
             # Deadlock 保护
             if t_mask.all():
@@ -133,8 +145,8 @@ class GeneticAlgorithmScheduler:
                 desired_station = valid_stations[0] 
                 
             # 3. 定人员
-            task_type_idx = int(sim_env.task_static_feat[best_task_id, 1].item())
-            req_demand = max(1, int(sim_env.task_static_feat[best_task_id, 2].item()))
+            task_type_idx = int(task_static_feat[best_task_id, 1].item())
+            req_demand = max(1, int(task_static_feat[best_task_id, 2].item()))
             
             # 从全局掩码过滤可用工人
             available_workers = [w for w in range(self.num_workers) if not w_mask[w].item()]
@@ -142,9 +154,9 @@ class GeneticAlgorithmScheduler:
             # 再过滤：有技能且站位绑定(Lock)不冲突的可用工人
             skilled_available = []
             for w in available_workers:
-                worker_skills = sim_env.worker_skill_matrix[w]
-                worker_lock = sim_env.worker_locks[w]
-                if worker_skills[task_type_idx] > 0.5 and (worker_lock == 0 or worker_lock == desired_station + 1):
+                worker_skills_local = worker_skill_matrix[w]
+                worker_lock = worker_locks[w]
+                if worker_skills_local[task_type_idx] > 0.5 and (worker_lock == 0 or worker_lock == desired_station + 1):
                     skilled_available.append(w)
             
             if len(skilled_available) < req_demand:

@@ -16,7 +16,7 @@ from models.hb_gat_pn import HBGATPN
 from ppo_agent import PPOAgent
 from configs import configs
 import pandas as pd
-from baseline_ga import GeneticAlgorithmScheduler
+from baselines.heuristic.baseline_ga import GeneticAlgorithmScheduler
 from utils.visualization import plot_gantt
 import random
 

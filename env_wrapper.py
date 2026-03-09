@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 from environment import AirLineEnv_Graph
+from configs import configs
 
 def init_env(args, seed=None):
     """
@@ -68,6 +69,14 @@ def extract_flat_state_for_baselines(env):
     worker_free_flat = env.worker_free_time.flatten() # [W]
     worker_sync_flat = (worker_free_flat - env.current_time)
     worker_sync_flat = np.maximum(worker_sync_flat, 0)
+    
+    # [PADDING FIX] 强制将可能动态变化长度的工人数组锁定为配置好的上限长度，供 MLP 食用
+    n_w_max = getattr(configs, 'n_w_max', 120)
+    current_w = len(worker_sync_flat)
+    if current_w < n_w_max:
+        worker_sync_flat = np.pad(worker_sync_flat, (0, n_w_max - current_w), 'constant', constant_values=0)
+    elif current_w > n_w_max:
+        worker_sync_flat = worker_sync_flat[:n_w_max]
     
     # 拼接组装成一个庞大的一维状态
     # 确保 DQN 这种只吃固定一维向量的模型能够正常运算，且不会污染异构图结构。
