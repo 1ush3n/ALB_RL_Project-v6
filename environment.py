@@ -234,10 +234,6 @@ class AirLineEnv_Graph(gym.Env):
         super().reset(seed=seed, options=options)
         if seed is not None:
              np.random.seed(seed)
-
-        self.use_hard_mask = getattr(configs, 'use_hard_mask_default', False)
-        if options is not None and 'use_hard_mask' in options:
-            self.use_hard_mask = options['use_hard_mask']
              
         # ====================
         # [Domain Randomization] Worker Pool Sampling
@@ -474,14 +470,12 @@ class AirLineEnv_Graph(gym.Env):
         
         start_time = self.current_time
         finish_time = start_time + duration
-        borrow_count = 0
+        
         # 更新工人状态与站位绑定
         for w in team:
             self.worker_free_time[w] = finish_time
             if self.worker_locks[w] == 0 and station_id != -1:
                 self.worker_locks[w] = station_id + 1
-            elif station_id != -1 and self.worker_locks[w] != station_id + 1:
-                borrow_count += 1
         
         if station_id != -1:
             # 更新站位工作量总和 (Workload - 人.小时)
@@ -549,37 +543,22 @@ class AirLineEnv_Graph(gym.Env):
                     blocked_penalty += 0.5
                     
         reward -= blocked_penalty
-        borrow_penalty_val = getattr(configs, 'borrow_penalty', 5.0)
-        reward -= borrow_penalty_val * borrow_count
         
-        # E. Dense Telescoping Makespan Reward (Reward Shaping)
-        # 提取当前状态
+        # E. Dense Telescoping Makespan Reward (取代原来的稀疏惩罚)
+        # 用真实的 Wall-Clock Makespan 来引导强化学习的步进 Delta 预测
         curr_makespan = np.max(self.station_wall_clock)
         curr_std = np.std(self.station_loads)
         
-        # 实际的增量
         delta_makespan = curr_makespan - prev_makespan
         delta_std = curr_std - prev_std
         
-        # 【核心改造 1】：计算当前任务在理想均摊情况下的"期望时间增量"
-        # 理论工作量 = 任务持续时间 * 参与人数
-        expected_delta_makespan = (duration * len(team)) / self.num_stations
-        
-        # 计算相对优势 (Advantage-like)
-        makespan_advantage = expected_delta_makespan - delta_makespan
-        
-        # 【核心改造 2】：使用缩放函数 σ (Tanh) 将其映射到良好的梯度区间
-        sigma_scale = getattr(configs, 'reward_sigma_scale', 0.5)
-        shaped_makespan_reward = float(np.tanh(sigma_scale * makespan_advantage))
-        
-        # 对于标准差，因为其本身就是为了绝对均衡，直接应用惩罚，并可以用一个适当的截断防止异常值
+        coef_makespan = getattr(configs, 'r_coef_makespan', 1.0)
         coef_std = 2.5
-        shaped_std_reward = -coef_std * delta_std
         
-        # 汇聚到总奖励
-        reward += shaped_makespan_reward + shaped_std_reward
+        # 将原有的 terminal 扣除分摊到每一步的改变中
+        reward -= (coef_makespan * delta_makespan) + (coef_std * delta_std)
         
-        # [Phase 2: Reward Clipping] 单步奖励硬截断，防止整体叠加后梯度极值爆炸
+        # [Phase 2: Reward Clipping] 单步奖励硬截断，防止梯度极值爆炸
         reward = np.clip(reward, -10.0, 10.0)
         
         # F. 终局结算 (Final Cleansing)
@@ -742,12 +721,7 @@ class AirLineEnv_Graph(gym.Env):
                         continue
                 
                 # 检查能够支持在这个站位s工作的空闲人员：即 未绑定(0) 或 已经绑定到(s+1) 的人，并且拥有 req_skill
-                if getattr(self, 'use_hard_mask', False):
-                    # 硬约束：只有未绑定或者属于当前站位的人才能用
-                    compatible_lock = (free_locks == 0) | (free_locks == s + 1)
-                else:
-                    # 软约束：所有人只要有技能均可借调（后续在 step 中给严厉惩罚）
-                    compatible_lock = np.ones_like(free_locks, dtype=bool)
+                compatible_lock = (free_locks == 0) | (free_locks == s + 1)
                 has_skill = free_skills[:, req_skill] > 0.5
                 avail = np.sum(compatible_lock & has_skill)
                 
