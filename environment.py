@@ -730,15 +730,14 @@ class AirLineEnv_Graph(gym.Env):
             for s in station_range:
                 if s < 0 or s >= self.num_stations: continue
                 
-                # [Hybrid Masking] 1. 站位容量硬限制 (Station Capacity Limit)
+                # 检查该站位是否已经满负荷 (物理工位挤满了)
                 current_bound = np.sum(self.worker_locks == s + 1)
-                # 【修改点】：增加 s != fixed。如果是强制站位，即使爆满也必须允许！
-                if current_bound >= capacity_limit and s != fixed:
-                    continue 
+                if current_bound >= capacity_limit:
+                    continue # 爆满，物理屏蔽该站位，强迫推往下游
                     
-                # [Hybrid Masking] 3. 站位工时过载防波堤 (Workload Limit)
-                # 【修改点】：增加 s != fixed。
-                if self.station_loads[s] >= workload_limit and s != fixed:
+                # 检查该站位是否工时堆积过度 (工作全被前排大包揽，导致下游吃灰)
+                if self.station_loads[s] >= workload_limit:
+                    # 对于极度吃重的最后一站略微放宽，但前排绝不姑息
                     if s < self.num_stations - 1:
                         continue
                 
