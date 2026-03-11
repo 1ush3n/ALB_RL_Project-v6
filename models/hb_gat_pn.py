@@ -49,7 +49,9 @@ class FeatureEmbedder(nn.Module):
 class HeteroGATEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.layers = nn.ModuleList()
+        # 将原来的 self.layers 拆分为 convs 和 norms
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList() 
         
         for _ in range(config.num_gat_layers):
             conv = HeteroConv({
@@ -65,18 +67,32 @@ class HeteroGATEncoder(nn.Module):
                 ('task', 'done_by', 'worker'): GATv2Conv(config.hidden_dim, config.hidden_dim, heads=config.num_heads, concat=False, add_self_loops=False),
                 
             }, aggr='sum')
-            self.layers.append(conv)
+            self.convs.append(conv)
+            
+            # 【新增逻辑】：为每种节点类型定义独立的 LayerNorm
+            norm_dict = nn.ModuleDict({
+                'task': nn.LayerNorm(config.hidden_dim),
+                'station': nn.LayerNorm(config.hidden_dim),
+                'worker': nn.LayerNorm(config.hidden_dim)
+            })
+            self.norms.append(norm_dict)
             
     def forward(self, x_dict, edge_index_dict):
-        for conv in self.layers:
+        # 【修改逻辑】：同时遍历卷积层和归一化层
+        for conv, norm_dict in zip(self.convs, self.norms):
             x_dict_out = conv(x_dict, edge_index_dict)
             
-            # HeteroConv 只返回作为 Edge 终点的节点更新。
-            # 必须手动保留未更新的节点（残差连接 + 身份映射）。
+            # 必须手动保留未更新的节点（残差连接 + 身份映射）
             x_dict_new = {k: v for k, v in x_dict.items()}
             
             for key, x in x_dict_out.items():
-                x = F.relu(x)
+                # 【新增逻辑】：在激活函数之前，对对应的节点类型进行 LayerNorm
+                if key in norm_dict:
+                    x = norm_dict[key](x)
+                
+                # 激活函数
+                x = F.relu(x)  # 建议：如果网络加深到 8 层以上，后续可以考虑换成 F.gelu(x) 保持梯度更平滑
+                
                 if key in x_dict:
                     # 残差连接 (Residual Connection)
                     x = x + x_dict[key] 

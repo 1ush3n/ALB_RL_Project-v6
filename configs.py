@@ -72,6 +72,11 @@ class configs:
     eval_freq = 2                  # 多少个 Episode 进行一次评估
     eval_temperature = 1.0         # 评估/推理时的采样温度 (0.0 表示确定的 Argmax 贪婪策略)
     
+    #软约束
+    use_hard_mask_default = False
+    borrow_penalty = 5.0
+    reward_sigma_scale = 0.5
+
     # [Learning Rate Schedule]
     lr_warmup_steps = 3           # 学习率预热步数 (Linear Warmup)
     min_lr = 1e-5                   # 最小学习率 (Cosine Annealing 下界)
