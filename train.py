@@ -129,9 +129,9 @@ def evaluate_model(env, agent, num_runs=1, temperature=None):
         end_time = time.time()
         
         if len(env.assigned_tasks) != env.num_tasks:
-            makespans.append(99999.0) # Matches GA's massive penalty
-            balances.append(9999.0)
-            rewards.append(total_reward - 10000.0)
+            makespans.append(np.max(env.station_wall_clock) + 500.0) 
+            balances.append(999.0)
+            rewards.append(total_reward - 50.0)
             schedules.append([])
             durations.append(end_time - start_time)
         else:
@@ -274,8 +274,7 @@ def train(args):
                 # 死锁检测 (Deadlock Check)
                 if t_mask.all():
                      print(f"DEADLOCK (Step {t}): 无可行任务。")
-                     # [Fix]: massive penalty (-10000.0) so it never prefers "suicide over working"
-                     reward = -10000.0 
+                     reward = -50.0
                      done = True
                      # 记录这一步以供学习 (改为轻量级 Snapshot)
                      memory.states.append(env.get_state_snapshot())
