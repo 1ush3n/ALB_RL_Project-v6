@@ -59,7 +59,9 @@ class configs:
     # [2026-02-27] Reduce Entropy to force network out of the random uniform policy (blindness)
     # [针对 3000 单的长序列防死锁补丁] 面对巨量状态，初期随机性非常关键。不可过低。
     c_entropy = 0.05                
-    # [Advanced Training Features 2026-02-20]
+    # [Entropy Annealing 2026-03-11] 强制智能体在后期收紧探索，不要摆烂
+    c_entropy_end = 0.001           # 熵衰减的终点（几乎不再鼓励盲目探索）
+    entropy_decay_episodes = 200    # 用多少代将 c_entropy 从初始值平滑降至 c_entropy_end
     accumulation_steps = 128       # [防过拟合核心机制] 在内存中聚集高达 16*128=2048 步全局经验后才做 1 次 PPO Update！严防过快更新导致跌入“死磕前几个节点”的局部最优！
     gae_lambda = 0.98               # GAE 优势函数的衰减因子 (适配 3000 极长序列，将长期优势传导给前置任务)
     use_muon = True                 # 是否使用 Muon 优化器进行 2D 张量的更新

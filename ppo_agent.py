@@ -362,11 +362,18 @@ class PPOAgent:
             # 兼容处理
             advantages = rewards.clone()
             
-        # 归一化 Advantages (有助于训练稳定性)
+        # 归一化 Advantages 与 Returns (有助于长期负反馈环境的训练稳定性)
         if advantages.std() > 1e-7:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
         else:
             advantages = advantages - advantages.mean()
+            
+        # [CRITICAL FIX: Return Normalization] 
+        # 防止 Critic 在面对 -20000 即将坍塌，将 Returns (即代码里的 rewards) 约束至正态区间 [-2, 2] 内
+        if rewards.std() > 1e-7:
+            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+        else:
+            rewards = rewards - rewards.mean()
         
         # 2. 准备 Batch 数据
         old_actions = memory.actions 
@@ -553,24 +560,25 @@ class PPOAgent:
                 # Value and Entropy Loss scaled by configs
                 c_val = getattr(configs, 'c_value', 0.5)
                 c_ent_base = getattr(configs, 'c_entropy', 0.01)
+                # [Phase 2: Entropy Decay] 受控的熵退火，随进程向贪婪坍缩，防止后期为了高 Entropy 而全面崩溃
+                # 注意：self.current_step 这里对应大概的训练总体进度。为了更精准对应，我们引入基于 config 的 decay 比例
+                progress = min(1.0, self.current_step / max(1, self.total_timesteps))
+                # 或者，如果传入了 decay_ratio ，可以直接使用外部调度。这里我们用内部的 progress 计算：
+                c_ent_base = getattr(configs, 'c_entropy', 0.05)
+                c_ent_end = getattr(configs, 'c_entropy_end', 0.001)
                 
-                # [Phase 2: Entropy Decay] 熵退火，随进程向贪婪坍缩
-                c_ent = c_ent_base * (1.0 - 0.9 * progress) 
+                # 线性衰减
+                c_ent = c_ent_base - progress * (c_ent_base - c_ent_end)
                 
                 c_pol = getattr(configs, 'c_policy', 1.0)
                 
-                # [CRITICAL FIX: Huber Loss & Value Clipping]
+                # [CRITICAL FIX: MSE Loss & No Clipping]
                 b_reward = batch.y_reward.view(-1)
                 
-                if hasattr(batch, 'y_value'):
-                    old_values = batch.y_value.view(-1).to(self.device)
-                    # Critic 价值追踪裁剪，防止一次更新步伐过大导致网络崩塌
-                    v_clipped = old_values + torch.clamp(state_values - old_values, -curr_eps_clip, curr_eps_clip)
-                    loss1 = torch.nn.functional.huber_loss(state_values, b_reward, delta=10.0, reduction='none')
-                    loss2 = torch.nn.functional.huber_loss(v_clipped, b_reward, delta=10.0, reduction='none')
-                    value_loss = c_val * torch.max(loss1, loss2).mean()
-                else:
-                    value_loss = c_val * torch.nn.functional.huber_loss(state_values, b_reward, delta=10.0)
+                # 因为 Return 已经被恰当地标准化，我们不需要再用畸形的 Delta=10 Huber Loss，
+                # 也无需任何可能引发拟合死锁的 Value Clipping (0.2 的 EPS 会使得几万的残差永远无法收敛)。
+                # 直接采取标准的 MSE Loss 即为学术界针对极大/负分长序列环境的最优应对:
+                value_loss = c_val * self.MseLoss(state_values, b_reward)
                      
                 entropy_loss = -c_ent * entropy.mean()
                 
