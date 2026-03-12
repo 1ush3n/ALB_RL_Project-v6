@@ -95,22 +95,12 @@ def evaluate_model(env, agent, num_runs=1, temperature=None):
         start_time = time.time()
         while not done:
             task_mask, station_mask, worker_mask = env.get_masks()
-            
+            # [Forward Allocation Fix] 此前为了修复环境不让忙碌人接活而加入的 while 等待逻辑已被弃用。
+            # 新架构下 get_masks 永远不会阻挡合法排队任务，因此一旦 get_masks 返回全 True，那就是网络连拓扑都不满足(真正的图死锁)。
             if task_mask.all():
-                # [Deadlock Fix: Wait-And-See]
-                # 不要立刻判死刑。尝试推进时间，看看是不是等一会儿就有工人下班或者槽位空出来了
-                while task_mask.all():
-                    can_wait = env.try_wait_for_resources()
-                    if not can_wait:
-                        # 真的死锁了（没人在干活，时间无法推进）
-                        print(f"[Eval] FATAL DEADLOCK detected! Returning max penalty.")
-                        done = True
-                        break
-                    # 等待成功，时间已经推进，重新拿一下掩码
-                    task_mask, station_mask, worker_mask = env.get_masks()
-                
-                if done:
-                    break
+                print(f"[Eval] FATAL DEADLOCK detected! Network topology restricts all remaining tasks.")
+                done = True
+                break
                 
             # 引入验证温度的动作选择
             action_ret = agent.select_action(
@@ -281,34 +271,23 @@ def train(args):
                 t_mask = task_mask.to(device)
                 s_mask = station_mask.to(device)
                 w_mask = worker_mask.to(device)
-                
-                # 死锁检测与防误判 (Wait-And-See)
-                while t_mask.all():
-                     # 尝试让环境自动跳向未来，等待有人释放或槽位变空
-                     can_wait = env.try_wait_for_resources()
-                     if not can_wait:
-                         print(f"REAL DEADLOCK (Step {t}): 无可行任务且无资源正在释放。")
-                         reward = -10000.0 
-                         done = True
-                         memory.states.append(env.get_state_snapshot())
-                         memory.actions.append((0,0,[])) 
-                         memory.logprobs.append(torch.tensor(0.0))
-                         memory.rewards.append(reward)
-                         memory.is_terminals.append(done)
-                         memory.masks.append((task_mask.cpu(), station_mask.cpu(), worker_mask.cpu()))
-                         memory.values.append(0.0)
-                         ep_reward += reward
-                         break
+                # [Forward Allocation Fix]
+                # 由于我们通过特征增强使得 RL 能学会排队，掩码彻底放开。
+                # 如果依然出现 task_mask.all() 只有一种可能：图拓扑锁死（逻辑 Bug）或者真死锁。
+                if t_mask.all():
+                     print(f"REAL DEADLOCK (Step {t}): 没有任何合法的任务派发（可能是前置任务全卡死）。")
+                     reward = -10000.0 
+                     done = True
+                     memory.states.append(env.get_state_snapshot())
+                     memory.actions.append((0,0,[])) 
+                     memory.logprobs.append(torch.tensor(0.0))
+                     memory.rewards.append(reward)
+                     memory.is_terminals.append(done)
+                     memory.masks.append((task_mask.cpu(), station_mask.cpu(), worker_mask.cpu()))
+                     memory.values.append(0.0)
+                     ep_reward += reward
+                     break
                      
-                     # 从未来醒来，重新看看现在可以派活了吗
-                     task_mask, station_mask, worker_mask = env.get_masks()
-                     t_mask = task_mask.to(device)
-                     s_mask = station_mask.to(device)
-                     w_mask = worker_mask.to(device)
-                     
-                if done:
-                    break
-                
                 if w_mask.all():
                      # 所有工人都在忙，理论上 _advance_time 会跳过这段时间，
                      # 但如果出现这种情况，说明时间推进逻辑可能需要检查。
@@ -399,7 +378,7 @@ def train(args):
                 if makespan < best_makespan:
                     best_makespan = makespan
                     torch.save(agent.policy.state_dict(), best_model_path)
-                    print(f"New Best Model Saved! Makespan: {best_makespan}")
+                    print(f"NNNNNNNNNNNew Best Model Saved! Makespan: {best_makespan}")
                     
                     # [Real-time Tracer] 实时快照抓拍最好成绩的排单策略
                     trace_dir = "results/eval_traces"

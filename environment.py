@@ -283,8 +283,7 @@ class AirLineEnv_Graph(gym.Env):
         self.station_wall_clock.fill(0.0)
         self.event_queue = []
         
-        # [Slot Model] 工位槽状态：跟踪每个站位正在并行执行的工序数量
-        self.station_active_tasks = np.zeros(self.num_stations, dtype=int)
+        # [Slot Model] - 记录每个站位中各并行工序的预计完成时间，用于计算等待延迟
         # 小顶堆：记录每个站位中各并行工序的预计完成时间，用于计算等待延迟
         self.station_task_finish_times = [[] for _ in range(self.num_stations)]
         
@@ -631,8 +630,8 @@ class AirLineEnv_Graph(gym.Env):
                     # 由于我们使用 finish_time 推入，这里理论上不需要严苛清理，
                     # 只要为了防止 heap 无限膨胀而在完成时 pop 一次堆顶即可 (或者让其在下一次被覆写)
                     if sid >= 0:
-                        if self.station_slot_heaps[sid]:
-                            heapq.heappop(self.station_slot_heaps[sid])
+                        if self.station_task_finish_times[sid]:
+                            heapq.heappop(self.station_task_finish_times[sid])
                     
                     # 解锁后继
                     for succ in self.successors[tid]:
