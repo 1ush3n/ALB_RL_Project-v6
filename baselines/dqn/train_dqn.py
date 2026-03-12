@@ -264,11 +264,27 @@ def train_dqn(args):
             
             while not done and step_count < max_steps:
                 step_count += 1
+                # [Deadlock Fix: Wait-And-See]
+                t_mask_raw, _, _ = env.get_masks()
+                while t_mask_raw.all():
+                    if not env.try_wait_for_resources():
+                        # 彻底死锁
+                        break
+                    t_mask_raw, _, _ = env.get_masks()
+                
+                if t_mask_raw.all():
+                    # 彻底死锁
+                    reward = -100.0
+                    done = True
+                    agent.remember(state, (0, 0, [0]), reward, state, done)
+                    ep_reward += reward
+                    break
+                    
                 # 选择动作
                 action = agent.select_action(state, env_for_demand=env)
                 
                 if action is None:
-                    # [Deadlock Intercept] Environment is totally locked due to bad prior choices. Abort immediately.
+                    # [Safety Net] 如果 select_action 内部仍然发生计算错误返回了 None
                     reward = -100.0
                     done = True
                     agent.remember(state, (0, 0, [0]), reward, state, done)

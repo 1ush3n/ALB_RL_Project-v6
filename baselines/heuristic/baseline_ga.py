@@ -119,10 +119,16 @@ class GeneticAlgorithmScheduler:
             s_mask = s_mask_raw.numpy() if hasattr(s_mask_raw, 'numpy') else s_mask_raw
             w_mask = w_mask_raw.numpy() if hasattr(w_mask_raw, 'numpy') else w_mask_raw
             
-            # Deadlock 保护
-            if t_mask.all():
-                # 遭受锁死的染色体给予极其恶劣的惩罚
-                return 999999.0, (99999.0, 9999.0, [])
+            # Deadlock 保护 (Wait-And-See)
+            while t_mask.all():
+                if not sim_env.try_wait_for_resources():
+                    # 真正的死锁，锁死后给予极其恶劣的惩罚
+                    return 999999.0, (99999.0, 9999.0, [])
+                # 重新获取掩码
+                t_mask_raw, s_mask_raw, w_mask_raw = sim_env.get_masks()
+                t_mask = t_mask_raw.numpy() if hasattr(t_mask_raw, 'numpy') else t_mask_raw
+                s_mask = s_mask_raw.numpy() if hasattr(s_mask_raw, 'numpy') else s_mask_raw
+                w_mask = w_mask_raw.numpy() if hasattr(w_mask_raw, 'numpy') else w_mask_raw
             
             # 1. 在当前可做任务中，挑剔出 priority_map 最高的那个
             available_tasks = [i for i in range(self.num_tasks) if not t_mask[i].item()]

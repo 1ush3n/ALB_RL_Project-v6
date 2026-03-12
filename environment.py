@@ -221,8 +221,10 @@ class AirLineEnv_Graph(gym.Env):
         self.base_task_x[:, 5:15] = type_onehot
         self.base_task_x[:, 16:17] = demand
         
-        self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 9))], dim=1)
-        self.base_station_x = torch.zeros((self.num_stations, 12))
+        # [Feature Upgrade] worker base feat + wait_time slot (10 dims now instead of 9)
+        self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 10))], dim=1)
+        # [Feature Upgrade] station base feat + slot_wait_time (13 dims now instead of 12)
+        self.base_station_x = torch.zeros((self.num_stations, 13))
         
     def reset(self, randomize_duration=False, randomize_workers=False, seed=None, options=None):
         """
@@ -269,7 +271,8 @@ class AirLineEnv_Graph(gym.Env):
         self.worker_static_feat = torch.tensor(self.worker_efficiency, dtype=torch.float).unsqueeze(1)
         
         # 重建动态的 base_worker_x (维度随 num_workers 变化)
-        self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 9))], dim=1)
+        # 1(efficiency) + 10(skills) + 10(Padding: 1 wait, 1 free, 8 locks) = 21 dims
+        self.base_worker_x = torch.cat([self.worker_static_feat, self.worker_skill_matrix, torch.zeros((self.num_workers, 10))], dim=1)
         
         # 重置运行状态张量
         self.current_time = 0.0
@@ -279,6 +282,11 @@ class AirLineEnv_Graph(gym.Env):
         self.station_loads.fill(0.0)
         self.station_wall_clock.fill(0.0)
         self.event_queue = []
+        
+        # [Slot Model] 工位槽状态：跟踪每个站位正在并行执行的工序数量
+        self.station_active_tasks = np.zeros(self.num_stations, dtype=int)
+        # 小顶堆：记录每个站位中各并行工序的预计完成时间，用于计算等待延迟
+        self.station_task_finish_times = [[] for _ in range(self.num_stations)]
         
         self.assigned_tasks = [] 
         self.task_station_map = {} 
@@ -468,7 +476,27 @@ class AirLineEnv_Graph(gym.Env):
         # 1. 执行逻辑
         duration = self.calculate_duration(task_id, team)
         
-        start_time = self.current_time
+        # ==========================================
+        # [Forward Allocation Engine]
+        # 计算该工序真正的起步时间：必须满足（现在，人齐，且工位有空）
+        # ==========================================
+        
+        # 1. 团队集结完毕时间 (木桶原理)
+        team_ready_time = self.current_time
+        if team:
+            team_ready_time = max([self.worker_free_time[w] for w in team])
+            
+        # 2. 站位槽位腾出时间
+        station_ready_time = self.current_time
+        if station_id >= 0:
+            max_slots = getattr(configs, 'max_slots_per_station', 15)
+            # 堆表示当前正占据该站位的各工序何时离开。只有当堆里占满容量时，新来的人才需要等最早走的那一个(即堆顶)
+            heap = self.station_task_finish_times[station_id]
+            if len(heap) >= max_slots:
+                station_ready_time = heap[0]
+                
+        # 3. 三者取大，得到实际安排进时间表里的开工时刻
+        start_time = max(self.current_time, team_ready_time, station_ready_time)
         finish_time = start_time + duration
         
         # 更新工人状态与站位绑定
@@ -478,6 +506,10 @@ class AirLineEnv_Graph(gym.Env):
                 self.worker_locks[w] = station_id + 1
         
         if station_id != -1:
+            # [Slot Model] 将本工序完成时间塞入站位的可用时间池
+            # 不再维护已废弃的 station_active_tasks
+            heapq.heappush(self.station_task_finish_times[station_id], finish_time)
+            
             # 更新站位工作量总和 (Workload - 人.小时)
             self.station_loads[station_id] += duration * len(team) 
             
@@ -594,6 +626,14 @@ class AirLineEnv_Graph(gym.Env):
                 ev = heapq.heappop(self.event_queue)
                 if ev.type == 'TASK_FINISH':
                     tid = ev.data['task_id']
+                    sid = ev.data['station_id']
+                    # [Slot Model] 释放工位的历史使用记录 (将其从堆中清理)
+                    # 由于我们使用 finish_time 推入，这里理论上不需要严苛清理，
+                    # 只要为了防止 heap 无限膨胀而在完成时 pop 一次堆顶即可 (或者让其在下一次被覆写)
+                    if sid >= 0:
+                        if self.station_slot_heaps[sid]:
+                            heapq.heappop(self.station_slot_heaps[sid])
+                    
                     # 解锁后继
                     for succ in self.successors[tid]:
                         self.completed_preds[succ] += 1
@@ -632,18 +672,29 @@ class AirLineEnv_Graph(gym.Env):
                  # 至少有一个任务是 False (即 Valid)
                  break
             
-            # 4. 如果没有 Valid 任务，则必须跳跃时间
+            # 4. 如果没有 Valid 任务，则必须跳跃时间 (交由 _advance_time 内部或外部决定)
             if not self.event_queue:
-                if len(self.assigned_tasks) < self.num_tasks:
-                     # 异常：队列空了且任务没做完 -> 死锁
-                     break 
-                else:
-                     # 全部完成
-                     break 
+                # 真正的环境空转末端，退出循环，让外部拿到掩码后再决定是否调用 try_wait_for_resources
+                break
             
             # Jump to next event
             next_ev = self.event_queue[0]
             self.current_time = next_ev.time
+            # 循环会继续处理 next_ev
+
+    def try_wait_for_resources(self):
+        """
+        [Deadlock Fix] 当外部(如 train.py)拿到全 False 的 mask 时调用此方法。
+        主动将时间快进到下一个事件发生（释放工人或槽位），然后返回 True。
+        如果连未来的事件也没有了，说明发生了真正的死锁，返回 False。
+        """
+        if not self.event_queue:
+            return False  # 真正的死锁：无人可用，且也没有人正在干活
+            
+        next_ev = self.event_queue[0]
+        self.current_time = next_ev.time
+        self._advance_time()  # 触发内部事件释放并尝试解锁新任务
+        return True
 
     def get_masks(self):
         """
@@ -660,7 +711,8 @@ class AirLineEnv_Graph(gym.Env):
         3. 站位必须符合拓扑约束 (<= 前驱的最大站位) - 暂未严格强制，目前主要靠 Fixed Station 约束。
         """
         # 1. Worker Mask (Global)
-        worker_mask_np = (self.worker_free_time > self.current_time)
+        # [Forward Allocation Enable] 不再因为“现在正忙”而掩码。任何时间都可以接新单进入待办队伍。
+        worker_mask_np = np.zeros(self.num_workers, dtype=bool)
         worker_mask = torch.tensor(worker_mask_np, dtype=torch.bool)
         
         # 2. Task Mask
@@ -670,13 +722,10 @@ class AirLineEnv_Graph(gym.Env):
         ready_indices = np.where(self.task_status == 1)[0]
         
         # 使用向量化计算获取空闲技能与锁定状态可用量
-        free_workers_idx = np.where(~worker_mask_np)[0]
-        if len(free_workers_idx) > 0:
-            free_skills = self.worker_skill_matrix[free_workers_idx].numpy() # [NumFree, 10]
-            free_locks = self.worker_locks[free_workers_idx] # [NumFree]
-        else:
-            free_skills = np.zeros((0, 10))
-            free_locks = np.zeros(0)
+        # 因为所有工人都允许（worker_mask 全 False），所以 free_workers 就是全体工人
+        free_workers_idx = np.arange(self.num_workers)
+        free_skills = self.worker_skill_matrix.numpy() 
+        free_locks = self.worker_locks
                  
         for t in ready_indices:
             # A. 站位约束
@@ -698,32 +747,17 @@ class AirLineEnv_Graph(gym.Env):
             # 构建该任务合法的备选站位域
             station_range = [fixed] if fixed != -1 else list(range(min_station, min(self.num_stations, max_station + 1)))
             
-            # [Hybrid Masking] 1. 站位容量硬限制 (Station Capacity Limit)
-            max_cap_ratio = getattr(configs, 'max_station_capacity_ratio', 0.6)
-            capacity_limit = int(self.num_workers * max_cap_ratio)
+            # [Forward Allocation Enable] 取消容量硬限制与防波堤
+            # AI 自己如果乱堆叠引发极长队，会被 Makespan 的 Dense Reward 惩罚。
             
-            # [Hybrid Masking] 3. 站位工时过载防波堤 (Workload Limit)
-            # 平均每个工位的理论工作量上限： 总量 / 站位数 * 1.5 倍容忍度
-            workload_limit = (self.total_base_workload / self.num_stations) * 1.5 
+            has_skill = free_skills[:, req_skill] > 0.5
             
             for s in station_range:
                 if s < 0 or s >= self.num_stations: continue
                 
-                # 1. 站位容量硬限制 (Station Capacity Limit)
-                current_bound = np.sum(self.worker_locks == s + 1)
-                # 【必须修改】：增加 and s != fixed
-                if current_bound >= capacity_limit and s != fixed:
-                    continue 
-                    
-                # 2. 站位工时过载防波堤 (Workload Limit)
-                # 【必须修改】：增加 and s != fixed
-                if self.station_loads[s] >= workload_limit and s != fixed:
-                    if s < self.num_stations - 1:
-                        continue
-                
                 # 检查能够支持在这个站位s工作的空闲人员：即 未绑定(0) 或 已经绑定到(s+1) 的人，并且拥有 req_skill
                 compatible_lock = (free_locks == 0) | (free_locks == s + 1)
-                has_skill = free_skills[:, req_skill] > 0.5
+                
                 avail = np.sum(compatible_lock & has_skill)
                 
                 if avail >= req_demand:
@@ -752,15 +786,21 @@ class AirLineEnv_Graph(gym.Env):
         
         # 2. Worker Features (In-place refresh)
         worker_x = self.base_worker_x.clone()
-        is_free_bool = (self.worker_free_time <= self.current_time)
-        worker_x[:, 11] = torch.tensor(is_free_bool, dtype=torch.float)
         
-        # [Feature Upgrade] One-Hot Encode Lock state (Lock=0 means 12, Lock=1 means 13...)
-        worker_x[:, 12:20] = 0.0 # Clear
+        # [Feature Upgrade: 连续时间特征支撑排队决策]
+        # 计算工人的预估等待时间: max(0, worker_free_time - current_time) / 100.0
+        wait_times_w = np.maximum(0, self.worker_free_time - self.current_time)
+        # Efficiency(0), Skills(1~10), ProjectedWait(11)
+        worker_x[:, 11] = torch.tensor(wait_times_w, dtype=torch.float) / 100.0
+        
+        is_free_bool = (self.worker_free_time <= self.current_time)
+        worker_x[:, 12] = torch.tensor(is_free_bool, dtype=torch.float)
+        
+        # [Feature Upgrade] One-Hot Encode Lock state 
+        worker_x[:, 13:21] = 0.0 # Clear
         lock_indices = torch.tensor(self.worker_locks, dtype=torch.long)
-        # Cap index at 7 safely to prevent out-of-bounds if dynamic stations exceed 7
         lock_indices = torch.clamp(lock_indices, max=7) 
-        worker_x[torch.arange(self.num_workers), 12 + lock_indices] = 1.0
+        worker_x[torch.arange(self.num_workers), 13 + lock_indices] = 1.0
         
         data['worker'].x = worker_x
         
@@ -768,6 +808,17 @@ class AirLineEnv_Graph(gym.Env):
         station_x = self.base_station_x.clone()
         station_x[:, 0] = torch.tensor(self.station_loads, dtype=torch.float) / 1000.0
         
+        # [Feature Upgrade: 连续时间特征支撑排队决策]
+        # 计算站位槽位释放时间
+        max_slots = getattr(configs, 'max_slots_per_station', 15)
+        for s in range(self.num_stations):
+            heap = self.station_task_finish_times[s]
+            if len(heap) >= max_slots:
+                wait_time_s = max(0, heap[0] - self.current_time)
+            else:
+                wait_time_s = 0.0
+            station_x[s, 4] = wait_time_s / 100.0
+            
         # [Feature Upgrade] Macro Strategic Features for Path Planning
         global_mobile_count = np.sum(self.worker_locks == 0)
         station_x[:, 2] = float(global_mobile_count) / self.num_workers
@@ -834,21 +885,27 @@ class AirLineEnv_Graph(gym.Env):
         
         snap_num_workers = len(snapshot['worker_free_time'])
         worker_x = snapshot['base_worker_x'].clone()
-        is_free_bool = (snapshot['worker_free_time'] <= snapshot['current_time'])
-        worker_x[:, 11] = torch.tensor(is_free_bool, dtype=torch.float)
         
-        worker_x[:, 12:20] = 0.0
+        # [Feature Upgrade: Wait time rebuild]
+        wait_times_w = np.maximum(0, snapshot['worker_free_time'] - snapshot['current_time'])
+        worker_x[:, 11] = torch.tensor(wait_times_w, dtype=torch.float) / 100.0
+        
+        is_free_bool = (snapshot['worker_free_time'] <= snapshot['current_time'])
+        worker_x[:, 12] = torch.tensor(is_free_bool, dtype=torch.float)
+        
+        worker_x[:, 13:21] = 0.0
         snap_locks = snapshot['worker_locks']
         lock_indices = torch.tensor(snap_locks, dtype=torch.long).clamp(max=7)
-        worker_x[torch.arange(snap_num_workers), 12 + lock_indices] = 1.0
+        worker_x[torch.arange(snap_num_workers), 13 + lock_indices] = 1.0
         
         data['worker'].x = worker_x
         data['worker', 'can_do', 'task'].edge_index = snapshot['can_do_edge_index'].clone()
         
         station_x = self.base_station_x.clone()
         station_x[:, 0] = torch.tensor(snapshot['station_loads'], dtype=torch.float) / 1000.0
-        # Incorporate the true wall clock internally since it replaces the role of simple loads
-        # Using loads as a standard neural feature, while Wall-clock is tracked in standard Python vars.
+        
+        # [Feature Upgrade: Wait time rebuild]
+        max_slots = getattr(configs, 'max_slots_per_station', 15)
         
         global_mobile_count = np.sum(snap_locks == 0)
         station_x[:, 2] = float(global_mobile_count) / snap_num_workers

@@ -316,10 +316,25 @@ def train_basic_ppo(args):
             while not done and step_count < max_steps:
                 step_count += 1
                 
+                # [Deadlock Fix: Wait-And-See]
+                t_mask_raw, _, _ = env.get_masks()
+                while t_mask_raw.all():
+                    can_wait = env.try_wait_for_resources()
+                    if not can_wait:
+                        break
+                    t_mask_raw, _, _ = env.get_masks()
+                
+                if t_mask_raw.all():
+                    reward = -100.0
+                    done = True
+                    agent.store_reward(reward, done)
+                    ep_reward += reward
+                    break
+                
                 action = agent.select_action(state, env_for_demand=env)
                 
                 if action is None:
-                    # [Deadlock Intercept] Environment is totally locked. Abort immediately.
+                    # [Safety Net]
                     reward = -100.0
                     done = True
                     agent.store_reward(reward, done)

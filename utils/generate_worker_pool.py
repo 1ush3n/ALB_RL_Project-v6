@@ -36,7 +36,7 @@ def generate_worker_pool():
     # 其余随机分配 (每人 1~4 个技能)
     for w in range(n_w_max):
         current_skills = np.sum(skill_matrix[w])
-        target_skills = random.randint(1, 4)
+        target_skills = random.randint(2, 4)  # 每人至少 2 技能，缓解大数据集死锁
         
         if current_skills < target_skills:
             num_to_add = target_skills - current_skills

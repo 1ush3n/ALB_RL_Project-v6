@@ -97,9 +97,20 @@ def evaluate_model(env, agent, num_runs=1, temperature=None):
             task_mask, station_mask, worker_mask = env.get_masks()
             
             if task_mask.all():
-                # [Fix]: Prevent infinite lengths caused by picking blank tasks during a deadlock. 
-                print(f"[Eval] DEADLOCK detected! Returning max penalty.")
-                break
+                # [Deadlock Fix: Wait-And-See]
+                # 不要立刻判死刑。尝试推进时间，看看是不是等一会儿就有工人下班或者槽位空出来了
+                while task_mask.all():
+                    can_wait = env.try_wait_for_resources()
+                    if not can_wait:
+                        # 真的死锁了（没人在干活，时间无法推进）
+                        print(f"[Eval] FATAL DEADLOCK detected! Returning max penalty.")
+                        done = True
+                        break
+                    # 等待成功，时间已经推进，重新拿一下掩码
+                    task_mask, station_mask, worker_mask = env.get_masks()
+                
+                if done:
+                    break
                 
             # 引入验证温度的动作选择
             action_ret = agent.select_action(
@@ -271,22 +282,32 @@ def train(args):
                 s_mask = station_mask.to(device)
                 w_mask = worker_mask.to(device)
                 
-                # 死锁检测 (Deadlock Check)
-                if t_mask.all():
-                     print(f"DEADLOCK (Step {t}): 无可行任务。")
-                     # [Fix]: massive penalty (-10000.0) so it never prefers "suicide over working"
-                     reward = -10000.0 
-                     done = True
-                     # 记录这一步以供学习 (改为轻量级 Snapshot)
-                     memory.states.append(env.get_state_snapshot())
-                     memory.actions.append((0,0,[])) # Dummy Action
-                     memory.logprobs.append(torch.tensor(0.0))
-                     memory.rewards.append(reward)
-                     memory.is_terminals.append(done)
-                     memory.masks.append((task_mask.cpu(), station_mask.cpu(), worker_mask.cpu()))
-                     memory.values.append(0.0) # Deadlock value
-                     ep_reward += reward
-                     break
+                # 死锁检测与防误判 (Wait-And-See)
+                while t_mask.all():
+                     # 尝试让环境自动跳向未来，等待有人释放或槽位变空
+                     can_wait = env.try_wait_for_resources()
+                     if not can_wait:
+                         print(f"REAL DEADLOCK (Step {t}): 无可行任务且无资源正在释放。")
+                         reward = -10000.0 
+                         done = True
+                         memory.states.append(env.get_state_snapshot())
+                         memory.actions.append((0,0,[])) 
+                         memory.logprobs.append(torch.tensor(0.0))
+                         memory.rewards.append(reward)
+                         memory.is_terminals.append(done)
+                         memory.masks.append((task_mask.cpu(), station_mask.cpu(), worker_mask.cpu()))
+                         memory.values.append(0.0)
+                         ep_reward += reward
+                         break
+                     
+                     # 从未来醒来，重新看看现在可以派活了吗
+                     task_mask, station_mask, worker_mask = env.get_masks()
+                     t_mask = task_mask.to(device)
+                     s_mask = station_mask.to(device)
+                     w_mask = worker_mask.to(device)
+                     
+                if done:
+                    break
                 
                 if w_mask.all():
                      # 所有工人都在忙，理论上 _advance_time 会跳过这段时间，

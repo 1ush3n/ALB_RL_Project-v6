@@ -18,6 +18,7 @@ class configs:
     n_w = 100                        # 每回合训练抽取的最大工人数，及验证(Eval)阶段固定的工人数
                                     # 注意：实际任务数由 data_loader 动态加载，此处仅作参考或 Embedding 初始化上界
     max_station_capacity_ratio = 0.4  # [Hybrid Masking] 单个站位最大容许绑定全厂总人数的比例，超过此值则站位被强制 Mask 屏蔽
+    max_slots_per_station = 15        # [Slot Model] 每站位同时执行的最大工序数（物理工位槽），满槽后新工序需等待
     
     # ------------------
     # 模型超参数 (Model Hyperparameters)
@@ -29,8 +30,8 @@ class configs:
     
     # 输入特征维度 (根据 environment.py 中的 _get_observation 定义)
     task_feat_dim = 17              # Task Node Input Features [Duration, Status(4), Type(10), Wait(1), Demand(1)]
-    worker_feat_dim = 20            # Worker Node Input Features [Efficiency(1), Skills(10), IsFree(1), Lock(8)]
-    station_feat_dim = 12           # Station Node Input Features [Load(1), BoundRatio(1), MobileRatio(1), FreeBoundRatio(1)]
+    worker_feat_dim = 21            # Worker Node Input Features [Efficiency(1), Skills(10), is_free(1), ProjectedWait(1), Lock(8)]
+    station_feat_dim = 13           # Station Node Input Features [Load(1), BoundRatio(1), MobileRatio(1), FreeBoundRatio(1), SlotWait(1)]
     
     # ------------------
     # 泛化性与域随机化 (Domain Randomization)
