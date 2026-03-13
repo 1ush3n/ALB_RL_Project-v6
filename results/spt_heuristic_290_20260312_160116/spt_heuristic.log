@@ -1,0 +1,5 @@
+2026-03-12 16:01:16,622 - INFO - ========== spt_heuristic 实验开始 ==========
+2026-03-12 16:01:16,622 - INFO - 实验参数: {'data_path': 'data/290.csv', 'seed': 42, 'max_episodes': 3000, 'log_dir': 'tf-logs', 'result_dir': 'results', 'ablation_no_gat': False, 'ablation_no_pointer': False, 'ablation_no_mask': False, 'resume': False, 'num_runs': 1}
+2026-03-12 16:01:16,622 - INFO - 结果将归档至: results\spt_heuristic_290_20260312_160116
+2026-03-12 16:01:16,714 - INFO - SPT策略运行轮次: 1/1
+2026-03-12 16:01:21,881 - INFO - 轮次1 - Makespan: 183.61, 总奖励: -277.81

@@ -42,42 +42,18 @@ class GeneticAlgorithmScheduler:
         # 预存所有任务的合法依赖关系以保障生成合法的拓扑序列
         self.predecessors = env.predecessors
         
-    def _generate_valid_topological_sort(self):
-        """生成一个随机的且满足前置拓扑约束的任务排单序列 (基于 Kahn 算法变体)"""
-        in_degrees = {i: len(self.predecessors[i]) for i in range(self.num_tasks)}
-        ready_queue = [i for i in range(self.num_tasks) if in_degrees[i] == 0]
-        
-        topo_seq = []
-        while ready_queue:
-            # 随机挑选一个没有任何前置依赖的任务
-            idx = random.randrange(len(ready_queue))
-            u = ready_queue.pop(idx)
-            topo_seq.append(u)
-            
-            for v in self.env.successors[u]:
-                in_degrees[v] -= 1
-                if in_degrees[v] == 0:
-                    ready_queue.append(v)
-                    
-        return topo_seq
-        
     def _create_individual(self):
         """
-        初始化单挑染色体
-        Chrom1: 合法的工序序列 (形如 [7, 0, 12, ...])
-        Chrom2: 对应工序指派的站位 (形如 [2, 0, 1, ...])
-        Chrom3: 针对不同工序指派的“偏优”选人倾向种子序列
+        初始化单挑染色体：全优先级序列表示
+        Chrom1 (seq_pref): 工序选择优先级 (shape: [num_tasks])
+        Chrom2 (station_pref): 站位选择优先级 (shape: [num_tasks, num_stations])
+        Chrom3 (team_pref): 工人选择优先级 (shape: [num_tasks, num_workers])
         """
-        seq_chrom = self._generate_valid_topological_sort()
+        seq_pref = np.random.rand(self.num_tasks).tolist()
+        station_pref = np.random.rand(self.num_tasks, self.num_stations).tolist()
+        team_pref = np.random.rand(self.num_tasks, self.num_workers).tolist()
         
-        # 随机分配站位 (并不考虑是否超载，交由适应度函数去惩罚)
-        station_chrom = [random.randint(0, self.num_stations - 1) for _ in range(self.num_tasks)]
-        
-        # 队伍分配倾向随机映射 (0~1 浮点数，代表偏好顺序)
-        # 每一次评估时，将按照这些偏好在满足技能束缚的池子里挑人
-        team_preference_chrom = np.random.rand(self.num_tasks, self.num_workers).tolist()
-        
-        return {'seq': seq_chrom, 'station': station_chrom, 'team_pref': team_preference_chrom}
+        return {'seq_pref': seq_pref, 'station_pref': station_pref, 'team_pref': team_pref}
 
     def _init_population(self):
         return [self._create_individual() for _ in range(self.pop_size)]
@@ -91,8 +67,8 @@ class GeneticAlgorithmScheduler:
         sim_env = copy.deepcopy(self.env)
         sim_env.reset() # Soft reset
         
-        seq = individual['seq']
-        stations = individual['station']
+        seq_prefs = np.array(individual['seq_pref'])
+        station_prefs = np.array(individual['station_pref'])
         team_prefs = np.array(individual['team_pref'])
         
         # [安全补丁: 强制标量化/NumPy化]
@@ -100,9 +76,6 @@ class GeneticAlgorithmScheduler:
         worker_skill_matrix = sim_env.worker_skill_matrix.numpy() if hasattr(sim_env.worker_skill_matrix, 'numpy') else sim_env.worker_skill_matrix
         worker_locks = sim_env.worker_locks.numpy() if hasattr(sim_env.worker_locks, 'numpy') else sim_env.worker_locks
         task_static_feat = sim_env.task_static_feat.numpy() if hasattr(sim_env.task_static_feat, 'numpy') else sim_env.task_static_feat
-        
-        # 将工序排队转化为优先级字典 (排在越前面优先级数值越高)
-        priority_map = {task_id: (self.num_tasks - idx) for idx, task_id in enumerate(seq)}
         
         done = False
         total_makespan = float('inf')
@@ -120,35 +93,24 @@ class GeneticAlgorithmScheduler:
             w_mask = w_mask_raw.numpy() if hasattr(w_mask_raw, 'numpy') else w_mask_raw
             
             # Deadlock 保护 (Wait-And-See)
-            while t_mask.all():
-                if not sim_env.try_wait_for_resources():
-                    # 真正的死锁，锁死后给予极其恶劣的惩罚
-                    return 999999.0, (99999.0, 9999.0, [])
-                # 重新获取掩码
-                t_mask_raw, s_mask_raw, w_mask_raw = sim_env.get_masks()
-                t_mask = t_mask_raw.numpy() if hasattr(t_mask_raw, 'numpy') else t_mask_raw
-                s_mask = s_mask_raw.numpy() if hasattr(s_mask_raw, 'numpy') else s_mask_raw
-                w_mask = w_mask_raw.numpy() if hasattr(w_mask_raw, 'numpy') else w_mask_raw
+            if t_mask.all():
+                # 在开放排队的情况下依然没有任务，是真正的死锁
+                return 999999.0, (99999.0, 9999.0, [])
             
-            # 1. 在当前可做任务中，挑剔出 priority_map 最高的那个
+            # 1. 在当前可做任务中，挑剔出 seq_prefs 最高的那个
             available_tasks = [i for i in range(self.num_tasks) if not t_mask[i].item()]
             
             if not available_tasks: 
-                sim_env._advance_time()
-                continue
+                return 999999.0, (99999.0, 9999.0, [])
                 
-            best_task_id = max(available_tasks, key=lambda x: priority_map[x])
+            best_task_id = max(available_tasks, key=lambda x: seq_prefs[x])
             
             # 2. 定站位
-            # 若配置的站位非法(mask=True)，则强制分配给当前合法的、序号最小的站位
-            desired_station = stations[best_task_id]
-            if s_mask[best_task_id, desired_station].item():
-                # 找一个合法的站位 (容错)
-                valid_stations = [s for s in range(self.num_stations) if not s_mask[best_task_id, s].item()]
-                if not valid_stations:
-                    sim_env._advance_time() # 没任何站位空闲，被逼跳过时间
-                    continue
-                desired_station = valid_stations[0] 
+            # 从所有合法站位中，选择 station_prefs 最高的那个
+            valid_stations = [s for s in range(self.num_stations) if not s_mask[best_task_id, s].item()]
+            if not valid_stations:
+                return 999999.0, (99999.0, 9999.0, [])
+            desired_station = max(valid_stations, key=lambda s: station_prefs[best_task_id, s])
                 
             # 3. 定人员
             task_type_idx = int(task_static_feat[best_task_id, 1].item())
@@ -166,9 +128,8 @@ class GeneticAlgorithmScheduler:
                     skilled_available.append(w)
             
             if len(skilled_available) < req_demand:
-                 # 人数不够，无法开工，强行推进时间释放工人
-                 sim_env._advance_time()
-                 continue
+                 # 人数不够，排队也等不到足够的人(比如全厂没这么多匹配技能的)，直接判死刑
+                 return 999999.0, (99999.0, 9999.0, [])
                  
             # 根据当前工序的偏好染色体为这些合格工人打分并降序排序
             prefs = team_prefs[best_task_id]
@@ -190,42 +151,42 @@ class GeneticAlgorithmScheduler:
 
     def _crossover(self, p1, p2):
         """
-        拓扑安全交叉算子。
-        Seq: 由于拓扑序列存在强依赖，使用简单的单点交叉会破坏合法性，故采用类似 Order Crossover 的拓扑修复机制，或更简单地交替继承生成。这里采用重新基于父代倾向生成拓扑的方法。
-        Station/Team: 采用平滑的均匀交叉 Uniform Crossover。
+        全量优先级均匀交叉 (Uniform Crossover)。
+        由于全部转为浮点优先级数组，我们摒弃复杂的序列交叉，使用纯浮点的均匀混合。
         """
         c1, c2 = copy.deepcopy(p1), copy.deepcopy(p2)
         
-        # 1. 站位与团队倾向发生均匀交叉
         for i in range(self.num_tasks):
+            # Task preference crossover
             if random.random() < 0.5:
-                c1['station'][i], c2['station'][i] = p2['station'][i], p1['station'][i]
-                c1['team_pref'][i], c2['team_pref'][i] = p2['team_pref'][i], p1['team_pref'][i]
-                
-        # 2. 序列发生融合交叉 (保留合规性)
-        # 用启发式修复：按照 p1 的大体顺序构建，缺失的按 Kahn 补充
-        # (在此简易实现中，我们直接用一定概率发生突变来代替复杂的序列交叉，因为拓扑合法性极其苛刻)
-        if random.random() < 0.3:
-            c1['seq'] = self._generate_valid_topological_sort()
-        if random.random() < 0.3:
-            c2['seq'] = self._generate_valid_topological_sort()
+                c1['seq_pref'][i], c2['seq_pref'][i] = p2['seq_pref'][i], p1['seq_pref'][i]
             
+            # Station preference crossover
+            for j in range(self.num_stations):
+                if random.random() < 0.5:
+                    c1['station_pref'][i][j], c2['station_pref'][i][j] = p2['station_pref'][i][j], p1['station_pref'][i][j]
+                    
+            # Team preference crossover
+            for j in range(self.num_workers):
+                 if random.random() < 0.5:
+                    c1['team_pref'][i][j], c2['team_pref'][i][j] = p2['team_pref'][i][j], p1['team_pref'][i][j]
+                    
         return c1, c2
 
     def _mutate(self, ind):
-        """变异算子"""
-        # 序列部分：有概率重新洗牌 (生成新的合法序列)
-        if random.random() < self.mut_pb:
-             ind['seq'] = self._generate_valid_topological_sort()
-             
-        # 站位变异
+        """变异算子: 添加高斯扰动"""
         for i in range(self.num_tasks):
-            if random.random() < (self.mut_pb / 10.0): # 小概率变异具体站位
-                ind['station'][i] = random.randint(0, self.num_stations - 1)
-                
             # 偏好变异：添加扰动
-            if random.random() < (self.mut_pb / 5.0):
-                ind['team_pref'][i] = (np.array(ind['team_pref'][i]) + np.random.normal(0, 0.2, self.num_workers)).tolist()
+            if random.random() < self.mut_pb:
+                 ind['seq_pref'][i] += random.gauss(0, 0.2)
+                 
+            for j in range(self.num_stations):
+                 if random.random() < self.mut_pb:
+                      ind['station_pref'][i][j] += random.gauss(0, 0.2)
+                      
+            for j in range(self.num_workers):
+                 if random.random() < self.mut_pb:
+                      ind['team_pref'][i][j] += random.gauss(0, 0.2)
                 
         return ind
 

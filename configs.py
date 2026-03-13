@@ -18,7 +18,7 @@ class configs:
     n_w = 100                        # 每回合训练抽取的最大工人数，及验证(Eval)阶段固定的工人数
                                     # 注意：实际任务数由 data_loader 动态加载，此处仅作参考或 Embedding 初始化上界
     max_station_capacity_ratio = 0.4  # [Hybrid Masking] 单个站位最大容许绑定全厂总人数的比例，超过此值则站位被强制 Mask 屏蔽
-    max_slots_per_station = 15        # [Slot Model] 每站位同时执行的最大工序数（物理工位槽），满槽后新工序需等待
+    max_slots_per_station = 3        # [Slot Model] 每站位同时执行的最大工序数（物理工位槽），满槽后新工序需等待
     
     # ------------------
     # 模型超参数 (Model Hyperparameters)
@@ -57,7 +57,11 @@ class configs:
     # [Loss Balancing & Critic Isolation 2026-02-22]
     c_policy = 1.0                  # Policy Loss 权重
     c_value = 0.05                   # [已通过 Huber Loss 防爆] 安全调回标准的 0.5，Critic 不会再破坏全局梯度
-    # [2026-02-27] Reduce Entropy to force network out of the random uniform policy (blindness)
+    
+    # [Reward Coefficients 2026-03-12]
+    r_coef_makespan = 1.0           # 宏观目标：Makespan 下班时间推移惩罚 (极其容易稀疏，因为只看瓶颈)
+    r_coef_wait     = 0.1           # 微操目标：工序受到的绝对排队折磨时长 (强制 AI 选择当前就空闲资源)
+    
     # [针对 3000 单的长序列防死锁补丁] 面对巨量状态，初期随机性非常关键。不可过低。
     c_entropy = 0.05                
     # [Entropy Annealing 2026-03-11] 强制智能体在后期收紧探索，不要摆烂

@@ -19,10 +19,12 @@ def spt_policy(env):
     """
     SPT策略：优先选择耗时最短的就绪任务，随机指派符合条件的工人
     """
-    # 获取就绪任务（status=1）
-    ready_tasks = np.where(env.task_status == 1)[0]
-    if len(ready_tasks) == 0:
-        return None  # 无就绪任务
+    # 获取掩码（符合拓扑约束的可用任务）
+    task_mask, _, _ = env.get_masks()
+    if task_mask.all():
+        return None  # 无合法的符合拓扑的就绪任务
+        
+    ready_tasks = np.where(~task_mask.numpy())[0] if hasattr(task_mask, 'numpy') else np.where(~task_mask)[0]
     
     # 按耗时升序排序（SPT核心）
     task_durations = env.task_static_feat[ready_tasks, 0].numpy()
@@ -102,8 +104,7 @@ def run_spt(args):
                 ep_reward += reward
             
             run_duration = time.time() - run_start_time
-            task_mask, _, _ = env.get_masks()
-            makespan = np.max(env.station_wall_clock) if not task_mask.all() else 99999.0
+            makespan = np.max(env.station_wall_clock) if done else 99999.0
             
             total_makespan.append(makespan)
             total_reward.append(ep_reward)

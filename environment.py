@@ -585,9 +585,15 @@ class AirLineEnv_Graph(gym.Env):
         
         coef_makespan = getattr(configs, 'r_coef_makespan', 1.0)
         coef_std = 2.5
+        coef_wait = getattr(configs, 'r_coef_wait', 0.1)
         
         # 将原有的 terminal 扣除分摊到每一步的改变中
         reward = -(coef_makespan * delta_makespan) - (coef_std * delta_std)
+        
+        # [Forward Allocation Penalty] 独立的排队微操惩罚
+        # 哪怕本次调度分配不影响系统的总瓶颈下班时间 (delta_makespan=0)，但造成了空等，依然施加微弱惩罚
+        wait_time = max(0.0, start_time - self.current_time)
+        reward -= (coef_wait * wait_time)
         
         # [Phase 2: Reward Clipping] 单步奖励硬截断，防止梯度极值爆炸
         reward = np.clip(reward, -50.0, 50.0)
