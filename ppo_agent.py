@@ -253,19 +253,15 @@ class PPOAgent:
                     # 如果选不够人，说明策略出现断层死锁，直接将失败上传以施加真实的验证集惩罚。
                     return None, 0.0, 0.0, None, True
                     
-                missing = demand - len(team_indices)
-                available_indices = torch.where(current_worker_mask == False)[0]
-                if len(available_indices) >= missing:
-                    team_indices.extend(available_indices[:missing].tolist())
-                    for _ in range(missing):
-                        worker_logprobs.append(torch.tensor(0.0).to(self.device))
-                else:
-                    # 如果连违规的也不够，就随便塞填充满（避免底层算子形状崩溃）
-                    all_indices = torch.arange(obs['worker'].num_nodes)
-                    fallback = all_indices[:missing].tolist()
-                    team_indices.extend(fallback)
-                    for _ in range(missing):
-                        worker_logprobs.append(torch.tensor(0.0).to(self.device))
+                # [Zero-Fallback Enforcement] 原有的兜底机制已被彻底移除。
+                # 由于环境的 get_masks() 已经在物理和拓扑层面上保证了只有当满足 demand 人数（且技能、工位锁定状态都符合要求）时，
+                # 站位和任务才是合法的。如果在这里选不出足够的人，说明前置掩码与内层选人掩码存在逻辑脱节，或出现了未知的计算漏洞。
+                # 此时绝不可再凑数塞入假人或存入假概率，这会导致后期 update 产生爆炸的虚假 KL 并诱发一连串的崩溃！
+                raise RuntimeError(
+                    f"FATAL DEADLOCK: Failed to select enough valid workers (needed {demand}, got {len(team_indices)}).\n"
+                    f"The masking logic in environment get_masks() strictly guarantees worker sufficiency.\n"
+                    f"No manual fallback is ever allowed to preserve the KL purity. Please inspect the mask consistency!"
+                )
             
             
             total_worker_logprob = sum(worker_logprobs) if worker_logprobs else torch.tensor(0.0).to(self.device)
@@ -615,17 +611,17 @@ class PPOAgent:
             if mean_kl > self.target_kl * 1.5:
                  # 近端策略变化太过激进：紧急收紧下调学习率
                  for param_group in (self.optimizer_adam.param_groups if self.using_muon else self.optimizer.param_groups):
-                     param_group['lr'] = max(param_group['lr'] / 1.5, self.min_lr)
+                     param_group['lr'] = max(param_group['lr'] / 1.05, self.min_lr)
                  if self.using_muon:
                      for param_group in self.optimizer.param_groups:
-                         param_group['lr'] = max(param_group['lr'] / 1.5, self.min_lr * 0.02)
+                         param_group['lr'] = max(param_group['lr'] / 1.05, self.min_lr * 0.02)
             elif mean_kl < self.target_kl / 1.5:
                  # 近端策略迟滞不前：提速放宽学习率
                  for param_group in (self.optimizer_adam.param_groups if self.using_muon else self.optimizer.param_groups):
-                     param_group['lr'] = min(param_group['lr'] * 1.5, self.lr_max)
+                     param_group['lr'] = min(param_group['lr'] * 1.05, self.lr_max)
                  if self.using_muon:
                      for param_group in self.optimizer.param_groups:
-                         param_group['lr'] = min(param_group['lr'] * 1.5, self.lr_max * 0.02)
+                         param_group['lr'] = min(param_group['lr'] * 1.05, self.lr_max * 0.02)
                      
         self.current_step += 1
                 
