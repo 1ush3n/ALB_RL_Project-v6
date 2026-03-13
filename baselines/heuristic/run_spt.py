@@ -118,8 +118,14 @@ def run_spt(args):
             plot_gantt(best_schedules, os.path.join(exp_dir, "SPT_gantt.png"))
             tasks_data = []
             for (tid, sid, team, start, end) in best_schedules:
+                  # 获取原始 AO 号
+                  task_ao = env.raw_data['task_df']['task_id'].iloc[tid] if 'task_df' in env.raw_data else str(tid)
+                  # 获取真实的序号
+                  real_id = env.raw_data['task_df']['序号'].iloc[tid] if 'task_df' in env.raw_data and '序号' in env.raw_data['task_df'].columns else tid
+                  
                   tasks_data.append({
-                      'TaskID': tid,
+                      'TaskID': real_id,
+                      'TaskAO': task_ao,
                       'StationID': sid + 1,
                       'Team': str(team),
                       'Start': start,

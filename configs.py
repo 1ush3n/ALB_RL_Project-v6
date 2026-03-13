@@ -60,12 +60,13 @@ class configs:
     
     # [Reward Coefficients 2026-03-12]
     r_coef_makespan = 1.0           # 宏观目标：Makespan 下班时间推移惩罚 (极其容易稀疏，因为只看瓶颈)
-    r_coef_wait     = 0.1           # 微操目标：工序受到的绝对排队折磨时长 (强制 AI 选择当前就空闲资源)
+    # [Hotfix 2026-03-13] 彻底抹除导致贪婪短视的全局稠密化误导惩罚，严格遵从学术界 GAE 全局溯回理论
+    r_coef_wait     = 0.0           # (已废除) 微操目标：工序受到的绝对排队折磨时长 
     
     # [针对 3000 单的长序列防死锁补丁] 面对巨量状态，初期随机性非常关键。不可过低。
     c_entropy = 0.05                
     # [Entropy Annealing 2026-03-11] 强制智能体在后期收紧探索，不要摆烂
-    c_entropy_end = 0.001           # 熵衰减的终点（几乎不再鼓励盲目探索）
+    c_entropy_end = 0.01            # 熵衰减的终点 (上调以免重蹈后期 Policy 极端自信后崩溃引发 Loss 的覆辙)
     entropy_decay_episodes = 200    # 用多少代将 c_entropy 从初始值平滑降至 c_entropy_end
     accumulation_steps = 128       # [防过拟合核心机制] 在内存中聚集高达 16*128=2048 步全局经验后才做 1 次 PPO Update！严防过快更新导致跌入“死磕前几个节点”的局部最优！
     gae_lambda = 0.98               # GAE 优势函数的衰减因子 (适配 3000 极长序列，将长期优势传导给前置任务)

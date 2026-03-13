@@ -590,10 +590,9 @@ class AirLineEnv_Graph(gym.Env):
         # 将原有的 terminal 扣除分摊到每一步的改变中
         reward = -(coef_makespan * delta_makespan) - (coef_std * delta_std)
         
-        # [Forward Allocation Penalty] 独立的排队微操惩罚
-        # 哪怕本次调度分配不影响系统的总瓶颈下班时间 (delta_makespan=0)，但造成了空等，依然施加微弱惩罚
+        # [Forward Allocation Penalty] 独立的排队微操惩罚 (已根据学术实验废除，避免 AI 丧失大局观)
         wait_time = max(0.0, start_time - self.current_time)
-        reward -= (coef_wait * wait_time)
+        # reward -= (coef_wait * wait_time)  # [Hotfix 2026-03-13] 注释掉有毒的微观诱导
         
         # [Phase 2: Reward Clipping] 单步奖励硬截断，防止梯度极值爆炸
         reward = np.clip(reward, -50.0, 50.0)

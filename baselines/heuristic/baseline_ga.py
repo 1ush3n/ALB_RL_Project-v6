@@ -7,6 +7,9 @@ import argparse
 import sys
 import os
 
+# [Hotfix 2026-03-13] 修复 Matplotlib/PyTorch 混合加载导致的 OpenMP 多重运行时崩溃
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # 动态添加根目录，以便导入环境和配置模块
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(os.path.dirname(current_dir))
@@ -14,6 +17,7 @@ sys.path.append(parent_dir)
 
 from environment import AirLineEnv_Graph
 from configs import configs
+from utils.visualization import plot_gantt
 
 class GeneticAlgorithmScheduler:
     """
@@ -255,6 +259,41 @@ class GeneticAlgorithmScheduler:
         makespan, balance_std, assigned_tasks = best_overall_metrics
         print(f"最好成绩 -> Makespan: {makespan:.2f} h | Balance Std: {balance_std:.2f}")
         
+        if assigned_tasks:
+            os.makedirs("results", exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            
+            # 先保存 CSV 保证排程数据安全落地
+            tasks_data = []
+            for (tid, sid, team, start, end) in assigned_tasks:
+                  # 获取原始 AO 号
+                  task_ao = self.env.raw_data['task_df']['task_id'].iloc[tid] if 'task_df' in self.env.raw_data else str(tid)
+                  # 获取真实的序号
+                  real_id = self.env.raw_data['task_df']['序号'].iloc[tid] if 'task_df' in self.env.raw_data and '序号' in self.env.raw_data['task_df'].columns else tid
+                  
+                  tasks_data.append({
+                      'TaskID': real_id,
+                      'TaskAO': task_ao,
+                      'StationID': sid + 1,
+                      'Team': str(team),
+                      'Start': start,
+                      'End': end,
+                      'Duration': end - start
+                  })
+            df = pd.DataFrame(tasks_data)
+            csv_path = f"results/GA_schedule_{timestamp}.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"[*] 成功保存排程明细至 -> {csv_path}")
+            
+            # 再绘制可能因环境报错的甘特图
+            gantt_path = f"results/GA_gantt_{timestamp}.png"
+            try:
+                plot_gantt(assigned_tasks, gantt_path)
+                print(f"[*] 成功保存甘特图至 -> {gantt_path}")
+            except Exception as e:
+                print(f"[!] 绘制甘特图失败: {e}")
+            
+            
         return makespan, balance_std, assigned_tasks
 
 if __name__ == "__main__":
