@@ -584,7 +584,7 @@ class AirLineEnv_Graph(gym.Env):
         delta_std = curr_std - prev_std
         
         coef_makespan = getattr(configs, 'r_coef_makespan', 1.0)
-        coef_std = 2.5
+        coef_std = getattr(configs, 'r_coef_std', 0.0)
         coef_wait = getattr(configs, 'r_coef_wait', 0.1)
         
         # 将原有的 terminal 扣除分摊到每一步的改变中
@@ -596,6 +596,11 @@ class AirLineEnv_Graph(gym.Env):
         
         # [Phase 2: Reward Clipping] 单步奖励硬截断，防止梯度极值爆炸
         reward = np.clip(reward, -50.0, 50.0)
+        
+        # [CRITICAL FIX: Reward Static Scaling]
+        # 把原始的巨大的 makespan 分差在底层压缩至 [-1, 1] 的健康小区间，
+        # 是保障后续 Critic 网络 MSELoss 不会因为几百万方差暴毙烧毁 Actor 的唯一前提
+        reward = reward * getattr(configs, 'reward_scale', 0.005)
         
         # F. 终局结算 (Final Cleansing)
         done = (len(self.assigned_tasks) == self.num_tasks)

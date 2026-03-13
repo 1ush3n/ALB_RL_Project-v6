@@ -43,40 +43,18 @@ class PPOAgent:
         
         self.MseLoss = nn.MSELoss() # 回归标准 MSE，强制 Critic 网络具有针对大数值误差的抛物线追赶能力
         
-        # [LR Scheduler Setup]
-        # Linear Warmup + Cosine Annealing
+        self.target_kl = getattr(configs, 'target_kl', 0.015)
+        self.min_lr = getattr(configs, 'min_lr', 1e-6)
+        self.lr_max = getattr(configs, 'lr_max', 5e-4)
         self.lr_warmup_steps = lr_warmup_steps
-        self.min_lr = min_lr
-        self.total_timesteps = max(1, total_timesteps) # 防止除零
+        self.initial_lr = lr
+        
+        self.total_timesteps = max(1, total_timesteps)
         self.current_step = 0
         
-        # 定义 LambdaLR
-        def lr_lambda(current_step):
-            # 1. Warmup Phase
-            if current_step < self.lr_warmup_steps:
-                return float(current_step) / float(max(1, self.lr_warmup_steps))
-            
-            # 2. SGDR (Cosine Annealing with Warm Restarts) Phase
-            step_after_warmup = current_step - self.lr_warmup_steps
-            T_0 = getattr(configs, 'sgdr_t0', 40)  # 第一周期步长 (由配置项控制)
-            
-            curr_cycle_step = step_after_warmup % T_0
-            progress = float(curr_cycle_step) / float(T_0)
-            
-            # 余弦衰减，到底部直接重启
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            
-            # Scaling: range [min_lr/lr, 1.0]
-            min_ratio = self.min_lr / self.lr
-            return min_ratio + (1.0 - min_ratio) * cosine_decay
-            
-        if self.using_muon:
-            self.scheduler_muon = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
-            self.scheduler_adam = torch.optim.lr_scheduler.LambdaLR(self.optimizer_adam, lr_lambda)
-            self.scheduler = self.scheduler_adam # 对外暴露主特征器使用的LR
-        else:
-            self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
-
+        # [CRITICAL FIX 2026-03-13] 我们彻底废除了预设规律的衰减引擎 (如 SGDR )。
+        # SGDR (Cosine Annealing) 会在周期到达时对学习率进行跃迁重启，这极大破坏了 PPO 的近端策略约束 (Trust Region)。
+        # 接下来我们将依照用户建议，使用动态评估前后新旧策略差距 (KL散度) 的自适应方法直接在 update 尾部变动 LR。
     def select_action(self, obs, mask_task=None, mask_station_matrix=None, mask_worker=None, deterministic=False, temperature=1.0, is_eval=False):
         """
         选择动作 (Select Action)。
@@ -368,12 +346,10 @@ class PPOAgent:
         else:
             advantages = advantages - advantages.mean()
             
-        # [CRITICAL FIX: Return Normalization] 
-        # 防止 Critic 在面对 -20000 即将坍塌，将 Returns (即代码里的 rewards) 约束至正态区间 [-2, 2] 内
-        if rewards.std() > 1e-7:
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
-        else:
-            rewards = rewards - rewards.mean()
+        # [CRITICAL FIX: Removed Return Normalization]
+        # 绝不应对 Critic 的 Target Returns 进行动态批次标准化，
+        # 否则每一轮 Update 的均值和方差都在变（移动靶），导致 Critic 永远无法收敛，产生巨大的梯度震荡。
+        # 我们改用配置中的静态系数缩小全局 reward。
         
         # 2. 准备 Batch 数据
         old_actions = memory.actions 
@@ -428,12 +404,15 @@ class PPOAgent:
         avg_value_loss = 0
         avg_entropy_loss = 0
         update_counts = 0
+        approx_kls = []
         
         self.optimizer.zero_grad()
         if self.using_muon:
             self.optimizer_adam.zero_grad()
             
+        final_epoch = self.k_epochs - 1
         for i_epoch in range(self.k_epochs):
+            epoch_kls = []
             for step_idx, batch in enumerate(loader):
                 batch = batch.to(self.device)
                 
@@ -539,14 +518,15 @@ class PPOAgent:
                 total_lp = torch.clamp(total_lp, min=-20.0, max=2.0)
                 
                 # --- PPO Loss Calculation ---
+                with torch.no_grad():
+                    log_ratio = total_lp - batch.y_logprob.view(-1)
+                    approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
+                    epoch_kls.append(approx_kl.item())
+                    
                 ratios = torch.exp(total_lp - batch.y_logprob.view(-1))
                 
                 # Use GAE advantages if available, else batch.y_reward - state_values (MC fallback)
                 b_adv = batch.y_advantage.view(-1) if hasattr(batch, 'y_advantage') else (batch.y_reward.view(-1) - state_values.detach())
-                
-                # [Phase 2: Batch-Level Advantage Normalization] 进一步压缩批次内方差
-                if b_adv.std() > 1e-5:
-                    b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
                 
                 # [Phase 2: Dynamic EPS Clip & Entropy Annealing] 动态衰减探索上限
                 progress = min(1.0, self.current_step / max(1, self.total_timesteps))
@@ -606,14 +586,47 @@ class PPOAgent:
                 avg_policy_loss += policy_loss.item()
                 avg_value_loss += value_loss.item()
                 avg_entropy_loss += entropy_loss.item()
-        
-        # [Step Scheduler]
-        if self.using_muon:
-            self.scheduler_muon.step()
-            self.scheduler_adam.step()
-        else:
-            self.scheduler.step()
             
+            # [CRITICAL FIX: Epoch Early Stopping for Trust Region Protection]
+            # 计算当前 epoch 的平均 KL
+            curr_epoch_kl = sum(epoch_kls) / len(epoch_kls) if epoch_kls else 0.0
+            
+            # 我们始终记录最后一轮未掐断的 KL 作为自适应引擎的参考
+            approx_kls = epoch_kls
+            
+            # 如果偏离已经大于设定的容忍度，立刻停止剩下的 Epochs！这极大地缩短了耗时，直接修好了假死！
+            if curr_epoch_kl > 1.5 * self.target_kl:
+                print(f"      -> Early stopping at epoch {i_epoch+1} due to reaching max KL: {curr_epoch_kl:.4f}")
+                break
+        
+        # [Adaptive KL LR Update 2026-03-13] 取代机械定式重启的 SGDR
+        mean_kl = sum(approx_kls) / len(approx_kls) if approx_kls else 0.0
+        
+        if self.current_step < self.lr_warmup_steps:
+             # [Phase 2: Linear Warmup 2026-03-13] 预热期内保护性放大 LR
+             warmup_factor = float(self.current_step + 1) / float(max(1, self.lr_warmup_steps))
+             target_lr = self.initial_lr * warmup_factor
+             for param_group in (self.optimizer_adam.param_groups if self.using_muon else self.optimizer.param_groups):
+                 param_group['lr'] = target_lr
+             if self.using_muon:
+                 for param_group in self.optimizer.param_groups:
+                     param_group['lr'] = target_lr * 0.02
+        else:
+            if mean_kl > self.target_kl * 1.5:
+                 # 近端策略变化太过激进：紧急收紧下调学习率
+                 for param_group in (self.optimizer_adam.param_groups if self.using_muon else self.optimizer.param_groups):
+                     param_group['lr'] = max(param_group['lr'] / 1.5, self.min_lr)
+                 if self.using_muon:
+                     for param_group in self.optimizer.param_groups:
+                         param_group['lr'] = max(param_group['lr'] / 1.5, self.min_lr * 0.02)
+            elif mean_kl < self.target_kl / 1.5:
+                 # 近端策略迟滞不前：提速放宽学习率
+                 for param_group in (self.optimizer_adam.param_groups if self.using_muon else self.optimizer.param_groups):
+                     param_group['lr'] = min(param_group['lr'] * 1.5, self.lr_max)
+                 if self.using_muon:
+                     for param_group in self.optimizer.param_groups:
+                         param_group['lr'] = min(param_group['lr'] * 1.5, self.lr_max * 0.02)
+                     
         self.current_step += 1
                 
         metrics = {
@@ -621,6 +634,7 @@ class PPOAgent:
             'Loss/Policy': avg_policy_loss / update_counts if update_counts > 0 else 0,
             'Loss/Value': avg_value_loss / update_counts if update_counts > 0 else 0,
             'Loss/Entropy': avg_entropy_loss / update_counts if update_counts > 0 else 0,
-            'Train/LearningRate': self.scheduler_adam.get_last_lr()[0] if self.using_muon else self.scheduler.get_last_lr()[0]
+            'Loss/ApproxKL': mean_kl,
+            'Train/LearningRate': self.optimizer_adam.param_groups[0]['lr'] if self.using_muon else self.optimizer.param_groups[0]['lr']
         }
         return metrics

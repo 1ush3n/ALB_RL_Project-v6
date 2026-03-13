@@ -50,7 +50,7 @@ class configs:
     
     lr = 1e-4                       # 初始学习率 (3000节点序列极长，不可轻易放大以免陷入局部最优死坑)
     gamma = 0.9995                  # [治病良方：时间折现因子] 3000步超级长线，必须将远视能力拉满！(1 / (1-0.9995) = 2000步视野)
-    k_epochs = 2                    # 每次更新循环次数 (每次少吸取一点教训，防止把错误的局部真理当做全局真理)
+    k_epochs = 4                    # 每次更新循环次数 (从 2 上调至 4，由于当前 KL 极小说明每次榨取的数据不足，应该对同批数据多更新几次来逼近目标 KL)
     eps_clip = 0.2                  # PPO Clip阈值 (e.g. 0.1 ~ 0.2)
     batch_size = 2                 # [防 OOM + 性能提升] 适当放宽至 8 兼顾 8G 显存稳定性
     
@@ -62,6 +62,8 @@ class configs:
     r_coef_makespan = 1.0           # 宏观目标：Makespan 下班时间推移惩罚 (极其容易稀疏，因为只看瓶颈)
     # [Hotfix 2026-03-13] 彻底抹除导致贪婪短视的全局稠密化误导惩罚，严格遵从学术界 GAE 全局溯回理论
     r_coef_wait     = 0.0           # (已废除) 微操目标：工序受到的绝对排队折磨时长 
+    # [Target Returns Scaler 2026-03-13]
+    reward_scale    = 0.005         # 全局奖励缩放乘数：在 environment 层面将上几千分差的值域缩放到 [-5, 5] 内，极大地稳定 Critic 的方差
     
     # [针对 3000 单的长序列防死锁补丁] 面对巨量状态，初期随机性非常关键。不可过低。
     c_entropy = 0.05                
@@ -78,12 +80,14 @@ class configs:
     max_episodes = 3000             # 探索万亿级组合的三千大劫
     update_every_episodes = 2       # 多少个 Episode 收集一次数据进行 PPO 更新
     eval_freq = 2                  # 多少个 Episode 进行一次评估
-    eval_temperature = 1.0         # 评估/推理时的采样温度 (0.0 表示确定的 Argmax 贪婪策略)
+    eval_temperature = 0.0         # [Hotfix 2026-03-13] 必须为 0.0！评估/推理时的采样温度 (0.0 表示确定的 Argmax 贪婪策略，1.0 意味着纯随机掷骰子)
     
-    # [Learning Rate Schedule]
-    lr_warmup_steps = 3           # 学习率预热步数 (Linear Warmup)
-    min_lr = 1e-5                   # 最小学习率 (Cosine Annealing 下界)
-
+    # [Adaptive KL Learning Rate Schedule 2026-03-13]
+    target_kl = 0.015               # 策略目标 KL 散度（衡量新旧策略差异的距离指标），用于自适应学习率调整。
+    lr_warmup_steps = 3             # 学习率预热步数 (Linear Warmup)
+    min_lr = 1e-6                   # 最小学习率保护下界
+    lr_max = 1e-3                   # 最大学习率保护上界 (放宽至 1e-3 以应对 KL 长时间极度低迷的情况)
+    
     # ------------------
     # 日志与监控 (Logging)
     # ------------------

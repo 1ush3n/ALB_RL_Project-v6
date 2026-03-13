@@ -276,7 +276,7 @@ def train(args):
                 # 如果依然出现 task_mask.all() 只有一种可能：图拓扑锁死（逻辑 Bug）或者真死锁。
                 if t_mask.all():
                      print(f"REAL DEADLOCK (Step {t}): 没有任何合法的任务派发（可能是前置任务全卡死）。")
-                     reward = -10000.0 
+                     reward = -100.0 * getattr(configs, 'reward_scale', 0.005) # [Hotfix 2026-03-13] 缩放并柔化惩罚，防止数百万 MSE VLoss 击穿网络
                      done = True
                      memory.states.append(env.get_state_snapshot())
                      memory.actions.append((0,0,[])) 
@@ -306,7 +306,7 @@ def train(args):
                 
                 # [Phase 5: Ablation Soft Penalty]
                 if getattr(configs, 'ablation_no_mask', False) and is_invalid:
-                     reward = -100.0  # Massive penalty for picking strictly invalid masked items
+                     reward = -50.0 * getattr(configs, 'reward_scale', 0.005) # [Hotfix] 缩放后的无效动作惩罚
                      done = True      # Terminate episode immediately to prevent infinite loops of illegal actions
                      
                      memory.states.append(env.get_state_snapshot()) 
