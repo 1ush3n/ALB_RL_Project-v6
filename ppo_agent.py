@@ -29,7 +29,7 @@ class PPOAgent:
             self.optimizer_adam = torch.optim.AdamW(adam_params, lr=lr)
             self.using_muon = True
         else:
-            self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
+            self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=lr, weight_decay=1e-4) # Modified to AdamW
             self.using_muon = False
             
         self.lr = lr
@@ -207,6 +207,9 @@ class PPOAgent:
             max_iter = demand * 2
             iter_cnt = 0
             
+            # [Phase 5: Autoregressive Optimization A] 初始化团队记忆
+            current_team_emb = None 
+            
             while len(team_indices) < demand and iter_cnt < max_iter:
                 iter_cnt += 1
                 
@@ -214,7 +217,7 @@ class PPOAgent:
                 if current_worker_mask.all():
                     break
                 
-                worker_logits = self.policy.worker_head.forward_choice(selected_task_emb, worker_embs, mask=current_worker_mask)
+                worker_logits = self.policy.worker_head.forward_choice(selected_task_emb, worker_embs, mask=current_worker_mask, current_team_emb=current_team_emb)
                 
                 if torch.isnan(worker_logits).any():
                     worker_logits = torch.nan_to_num(worker_logits, nan=mask_value)
@@ -241,6 +244,10 @@ class PPOAgent:
                 w_idx = w_action.item()
                 team_indices.append(w_idx)
                 worker_logprobs.append(w_lp)
+                
+                # [Phase 5: Autoregressive Optimization A] 刷新已选团队表征记忆
+                selected_worker_feats = worker_embs[0, team_indices, :]
+                current_team_emb = selected_worker_feats.mean(dim=0, keepdim=True) # [1, H]
                 
                 # 更新 Mask (选过的人不能再选)
                 current_worker_mask = current_worker_mask.clone() # 确保不 原地修改 影响下一轮
@@ -490,12 +497,17 @@ class PPOAgent:
                 
                 curr_mask = curr_mask | skill_mask | lock_mask.to(self.device)
                 
+                # [Phase 5: Autoregressive Optimization A] 
+                current_team_emb = None # [B, H]
+                team_emb_sum = torch.zeros(B_size, worker_x.size(-1)).to(self.device)
+                team_cnt = torch.zeros(B_size, 1).to(self.device)
+                
                 for k in range(batch.y_team.size(1)):
                     target = batch.y_team[:, k] 
                     valid_step = (target != -1)
                     if not valid_step.any(): continue
                     
-                    logits = self.policy.worker_head.forward_choice(sel_task_emb, worker_x, mask=curr_mask)
+                    logits = self.policy.worker_head.forward_choice(sel_task_emb, worker_x, mask=curr_mask, current_team_emb=current_team_emb)
                     if torch.isnan(logits).any(): logits = torch.nan_to_num(logits, nan=-1e9)
                     
                     dist = Categorical(logits=logits)
@@ -503,9 +515,26 @@ class PPOAgent:
                     team_lp[valid_step] += step_lp[valid_step]
                     entropy[valid_step] += dist.entropy()[valid_step]
                     
+                    # [Phase 5: Update current_team_emb for next iteration inside graph execution mode]
+                    valid_b_indices = torch.nonzero(valid_step).squeeze(-1)
+                    valid_targets = target[valid_step]
+                    
+                    selected_feats = worker_x[valid_b_indices, valid_targets]
+                    
+                    # 使用 clone() 保障 PyTorch 自动求导机制的连续性 (Gradient Preservation)
+                    next_team_emb_sum = team_emb_sum.clone()
+                    next_team_cnt = team_cnt.clone()
+                    
+                    next_team_emb_sum[valid_b_indices] += selected_feats
+                    next_team_cnt[valid_b_indices] += 1
+                    
+                    team_emb_sum = next_team_emb_sum
+                    team_cnt = next_team_cnt
+                    
+                    current_team_emb = team_emb_sum / torch.clamp(team_cnt, min=1.0)
+                    
                     # Update mask for next worker in team
                     curr_mask = curr_mask.clone()
-                    valid_b_indices = torch.nonzero(valid_step).squeeze(-1)
                     curr_mask[valid_b_indices, target[valid_step]] = True
                             
                 total_lp = task_lp + station_lp + team_lp
@@ -536,15 +565,19 @@ class PPOAgent:
                 # Value and Entropy Loss scaled by configs
                 c_val = getattr(configs, 'c_value', 0.5)
                 c_ent_base = getattr(configs, 'c_entropy', 0.01)
-                # [Phase 2: Entropy Decay] 受控的熵退火，随进程向贪婪坍缩，防止后期为了高 Entropy 而全面崩溃
-                # 注意：self.current_step 这里对应大概的训练总体进度。为了更精准对应，我们引入基于 config 的 decay 比例
-                progress = min(1.0, self.current_step / max(1, self.total_timesteps))
-                # 或者，如果传入了 decay_ratio ，可以直接使用外部调度。这里我们用内部的 progress 计算：
+                # [Phase 2: Entropy Decay 修复] 受控的熵退火，随进程向贪婪坍缩。
+                # 依据 configs.py 中指定的 entropy_decay_episodes 来精确计算退火进度
+                decay_eps = getattr(configs, 'entropy_decay_episodes', 200)
+                update_freq = getattr(configs, 'update_every_episodes', 2)
+                decay_updates = max(1, decay_eps // update_freq)  # 将 Episode 跨度转换为 Update 次数跨度
+                
+                ent_progress = min(1.0, self.current_step / decay_updates)
+                
                 c_ent_base = getattr(configs, 'c_entropy', 0.05)
-                c_ent_end = getattr(configs, 'c_entropy_end', 0.001)
+                c_ent_end = getattr(configs, 'c_entropy_end', 0.01)
                 
                 # 线性衰减
-                c_ent = c_ent_base - progress * (c_ent_base - c_ent_end)
+                c_ent = c_ent_base - ent_progress * (c_ent_base - c_ent_end)
                 
                 c_pol = getattr(configs, 'c_policy', 1.0)
                 

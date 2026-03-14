@@ -88,6 +88,10 @@ class configs:
     min_lr = 1e-6                   # 最小学习率保护下界
     lr_max = 3e-4                   # 最大学习率保护上界 (限制为 3e-4，防止自适应 LR 过大导致参数崩坏)
     
+    # [Network Architecture Ablations - 2026-03-14]
+    use_autoregressive_worker = True  # 开启自回归选人机制 (优化A)
+    use_attention_critic = True       # 开启Critic的全局注意力池化 (优化B)
+    
     # ------------------
     # 日志与监控 (Logging)
     # ------------------

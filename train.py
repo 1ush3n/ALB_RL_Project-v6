@@ -208,13 +208,22 @@ def train(args):
         if args.resume and os.path.exists(checkpoint_path):
             print(f"正在从 {checkpoint_path} 恢复训练...")
             try:
-                checkpoint = torch.load(checkpoint_path, map_location=device)
-                agent.policy.load_state_dict(checkpoint['model_state_dict'])
-                agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                start_episode = checkpoint['episode'] + 1
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                if 'model_state_dict' in checkpoint:
+                    agent.policy.load_state_dict(checkpoint['model_state_dict'])
+                else: 
+                     # Fallback if checkpoint is just a model_state_dict
+                    agent.policy.load_state_dict(checkpoint)
+
+                if 'optimizer_state_dict' in checkpoint:
+                    agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'optimizer_adam_state_dict' in checkpoint and hasattr(agent, 'optimizer_adam'):
+                    agent.optimizer_adam.load_state_dict(checkpoint['optimizer_adam_state_dict'])
+                
+                start_episode = checkpoint.get('episode', 0) + 1 if isinstance(checkpoint, dict) and 'episode' in checkpoint else 1
                 print(f"恢复成功. 起始 Episode: {start_episode}")
-            except RuntimeError as e:
-                print(f"⚠️ 恢复失败: 模型结构不匹配 (可能是 configs 修改了层数/维度). 跳过恢复。\n报错信息截取: {str(e)[:100]}...")
+            except Exception as e:
+                print(f"⚠️ 恢复失败: 模型结构不匹配或缺少键值 (可能是 configs 修改了层数/维度). 跳过恢复。\n报错信息截取: {str(e)[:100]}...")
         
         # 最佳模型记录
         best_makespan = float('inf')
@@ -276,7 +285,7 @@ def train(args):
                 # 如果依然出现 task_mask.all() 只有一种可能：图拓扑锁死（逻辑 Bug）或者真死锁。
                 if t_mask.all():
                      print(f"REAL DEADLOCK (Step {t}): 没有任何合法的任务派发（可能是前置任务全卡死）。")
-                     reward = -100.0 * getattr(configs, 'reward_scale', 0.005) # [Hotfix 2026-03-13] 缩放并柔化惩罚，防止数百万 MSE VLoss 击穿网络
+                     reward = -2000.0 * getattr(configs, 'reward_scale', 0.005) # [Hotfix 2026-03-13] 修复死锁奖励作弊 (Reward Hacking) 漏洞
                      done = True
                      memory.states.append(env.get_state_snapshot())
                      memory.actions.append((0,0,[])) 
@@ -306,7 +315,7 @@ def train(args):
                 
                 # [Phase 5: Ablation Soft Penalty]
                 if getattr(configs, 'ablation_no_mask', False) and is_invalid:
-                     reward = -50.0 * getattr(configs, 'reward_scale', 0.005) # [Hotfix] 缩放后的无效动作惩罚
+                     reward = -2000.0 * getattr(configs, 'reward_scale', 0.005) # [Hotfix] 缩放后的无效动作惩罚
                      done = True      # Terminate episode immediately to prevent infinite loops of illegal actions
                      
                      memory.states.append(env.get_state_snapshot()) 
@@ -363,16 +372,27 @@ def train(args):
                 
                 print(f"Epoch {ep:04d} [EVAL] | Makespan: {makespan:.2f} \t| Balance Std: {balance:.2f} \t| Eval Reward: {eval_reward:.2f} \t| Latency: {eval_duration:.4f}s")
                 
+                # [Phase 5: Attention Visualizer]
+                if getattr(configs, 'use_attention_critic', False) and hasattr(agent.policy, 'last_s_weights') and agent.policy.last_s_weights is not None:
+                     s_w = agent.policy.last_s_weights.cpu().numpy().flatten()
+                     weights_str = ", ".join([f"S{i+1}:{w:.2f}" for i, w in enumerate(s_w)])
+                     print(f"      -> [Critic Bottleneck Gaze] Station Attention Weights: {weights_str}")
+                
                 writer.add_scalar('Eval/WallClock_Makespan', makespan, ep)
                 writer.add_scalar('Eval/Workload_Balance_Std', balance, ep)
                 writer.add_scalar('Eval/Average_Return', eval_reward, ep)
                 writer.add_scalar('Eval/Inference_Time_sec', eval_duration, ep)
                 
                 # Save Latest
-                torch.save({
+                save_dict = {
                     'episode': ep,
                     'model_state_dict': agent.policy.state_dict(),
-                }, checkpoint_path)
+                    'optimizer_state_dict': agent.optimizer.state_dict()
+                }
+                if hasattr(agent, 'optimizer_adam'):
+                    save_dict['optimizer_adam_state_dict'] = agent.optimizer_adam.state_dict()
+                
+                torch.save(save_dict, checkpoint_path)
                 
                 # Save Best
                 if makespan < best_makespan:

@@ -176,6 +176,7 @@ class WorkerPointer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.query_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.ar_query_proj = nn.Linear(config.hidden_dim * 2, config.hidden_dim) # [Phase 5: Autoregressive Optimization A]
         self.key_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.attn = nn.Linear(config.hidden_dim, 1)
         
@@ -189,9 +190,16 @@ class WorkerPointer(nn.Module):
         # Stop Head: 预测是否停止选人 [Logit_Continue, Logit_Stop]
         self.stop_head = nn.Linear(config.hidden_dim * 2, 2) 
 
-    def forward_choice(self, task_emb, worker_embs, mask=None):
+    def forward_choice(self, task_emb, worker_embs, mask=None, current_team_emb=None):
         """选择下一个工人"""
-        query = self.query_proj(task_emb).unsqueeze(1) 
+        from configs import configs
+        if getattr(configs, 'use_autoregressive_worker', True) and current_team_emb is not None:
+            # 拼接历史被选人的联合特征
+            cat_feat_q = torch.cat([task_emb, current_team_emb], dim=-1) # [B, H*2]
+            query = self.ar_query_proj(cat_feat_q).unsqueeze(1)
+        else:
+            query = self.query_proj(task_emb).unsqueeze(1) 
+            
         keys = self.key_proj(worker_embs)
         
         from configs import configs
@@ -240,16 +248,29 @@ class HBGATPN(nn.Module):
         
         # 3. 价值网络 (Critic) 
         # 用于 PPO 的 Advantage 计算
-        # self.critic = nn.Sequential(
-        #     nn.Linear(config.hidden_dim * 3, 64),
-        #     nn.ReLU(),
-        #     nn.Linear(64, 1)
-        # )
+        
+        from configs import configs
+        # [Phase 5: Attention Pooling Optimization B]
+        self.station_attn = nn.Sequential(
+            nn.Linear(config.hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+        self.task_worker_attn = nn.Sequential(
+            nn.Linear(config.hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+        
+        c_dim = config.hidden_dim * 3 if getattr(configs, 'use_attention_critic', True) else config.hidden_dim * 6
+        
         self.critic = nn.Sequential(
-            nn.Linear(config.hidden_dim * 6, 64), # 扩展为 Mean+Max 拼接后的 6 倍维度
+            nn.Linear(c_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 1)
         )
+        
+        self.last_s_weights = None # 用于日志记录 Attention 权重
 
     def forward(self, batch_data):
         """
@@ -266,14 +287,51 @@ class HBGATPN(nn.Module):
         else:
             x_dict_encoded = self.encoder(x_dict, batch_data.edge_index_dict)
         
-        # Global Context: 对 Station, Task, Worker 节点进行 Mean + Max Pooling, 实现全视角及瓶颈感知
-        if hasattr(batch_data['station'], 'batch') and batch_data['station'].batch is not None:
-             # 原代码：
-             # station_ctx = global_mean_pool(x_dict_encoded['station'], batch_data['station'].batch)
-             # task_ctx = global_mean_pool(x_dict_encoded['task'], batch_data['task'].batch)
-             # worker_ctx = global_mean_pool(x_dict_encoded['worker'], batch_data['worker'].batch)
-             # global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1) # [B, H*3]
+        from torch_geometric.utils import softmax
+        from configs import configs
+        
+        # Global Context: 决定 Critic 与 Pointer 网络可用的宏观信息
+        if getattr(configs, 'use_attention_critic', True) and hasattr(batch_data['station'], 'batch') and batch_data['station'].batch is not None:
+             # ==== Attention Pooling ====
+             s_batch = batch_data['station'].batch
+             t_batch = batch_data['task'].batch
+             w_batch = batch_data['worker'].batch
              
+             s_weights = self.station_attn(x_dict_encoded['station'])
+             s_alphas = softmax(s_weights, s_batch)
+             from torch_geometric.nn import global_add_pool
+             station_ctx = global_add_pool(x_dict_encoded['station'] * s_alphas, s_batch)
+             
+             t_weights = self.task_worker_attn(x_dict_encoded['task'])
+             t_alphas = softmax(t_weights, t_batch)
+             task_ctx = global_add_pool(x_dict_encoded['task'] * t_alphas, t_batch)
+             
+             w_weights = self.task_worker_attn(x_dict_encoded['worker'])
+             w_alphas = softmax(w_weights, w_batch)
+             worker_ctx = global_add_pool(x_dict_encoded['worker'] * w_alphas, w_batch)
+             
+             global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1) # [B, H*3]
+             self.last_s_weights = s_weights.detach()
+             
+        elif getattr(configs, 'use_attention_critic', True):
+             # 针对推理时 batch_size=1 (无 batch 属性) 的 Attention 退化处理
+             s_weights = self.station_attn(x_dict_encoded['station'])
+             s_alphas = F.softmax(s_weights, dim=0)
+             station_ctx = torch.sum(x_dict_encoded['station'] * s_alphas, dim=0, keepdim=True)
+             
+             t_weights = self.task_worker_attn(x_dict_encoded['task'])
+             t_alphas = F.softmax(t_weights, dim=0)
+             task_ctx = torch.sum(x_dict_encoded['task'] * t_alphas, dim=0, keepdim=True)
+             
+             w_weights = self.task_worker_attn(x_dict_encoded['worker'])
+             w_alphas = F.softmax(w_weights, dim=0)
+             worker_ctx = torch.sum(x_dict_encoded['worker'] * w_alphas, dim=0, keepdim=True)
+             
+             global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1) # [1, H*3]
+             self.last_s_weights = s_weights.detach()
+             
+        elif hasattr(batch_data['station'], 'batch') and batch_data['station'].batch is not None:
+             # 原有 Mean+Max Pooling 逻辑 (Ablation fallback)
              station_mean = global_mean_pool(x_dict_encoded['station'], batch_data['station'].batch)
              task_mean = global_mean_pool(x_dict_encoded['task'], batch_data['task'].batch)
              worker_mean = global_mean_pool(x_dict_encoded['worker'], batch_data['worker'].batch)
@@ -284,12 +342,7 @@ class HBGATPN(nn.Module):
              
              global_context = torch.cat([station_mean, task_mean, worker_mean, station_max, task_max, worker_max], dim=1) # [B, H*6]
         else:
-             # 原代码：
-             # station_ctx = torch.mean(x_dict_encoded['station'], dim=0, keepdim=True)
-             # task_ctx = torch.mean(x_dict_encoded['task'], dim=0, keepdim=True)
-             # worker_ctx = torch.mean(x_dict_encoded['worker'], dim=0, keepdim=True)
-             # global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1)
-             
+             # 原有推理时无 batch 逻辑
              station_mean = torch.mean(x_dict_encoded['station'], dim=0, keepdim=True)
              task_mean = torch.mean(x_dict_encoded['task'], dim=0, keepdim=True)
              worker_mean = torch.mean(x_dict_encoded['worker'], dim=0, keepdim=True)
