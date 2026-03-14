@@ -275,8 +275,9 @@ class PPOAgent:
             
             action_logprob = task_logprob + station_logprob + total_worker_logprob
             # [CRITICAL FIX] 物理隔离隔离 Critic 防止其巨大的 Value Error 梯度捣毁底层共享 GAT 拓扑特征 (灾难性干扰致盲)
-            # state_value = self.policy.get_value(global_context)
-            state_value = self.policy.get_value(global_context.detach())
+            # [Phase 6: Dual-Stream Critic Evaluation]
+            # 传入完整的 state (batch_data)，由于处于 with torch.no_grad() 下，此处无需 detach，直接前向提取价值。
+            state_value = self.policy.get_value(obs)
             
             action_tuple = (t_idx, station_action.item(), team_indices)
             

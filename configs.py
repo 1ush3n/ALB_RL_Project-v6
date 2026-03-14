@@ -54,6 +54,10 @@ class configs:
     eps_clip = 0.2                  # PPO Clip阈值 (e.g. 0.1 ~ 0.2)
     # [Phase 6: OOM Warning Mitigation] 对于双流大图的 8G 显存优化
     batch_size = 4                 # [双骨干显存翻倍] 退回至 4，严防 RTX 4060 爆显存
+    max_slots_per_station = 15      # 物理环境:每个站位允许的最大并行工序数
+    
+    # [Phase 7: Estimated Cmax Heuristic 2026-03-14]
+    estimated_cmax_station_slots = 1.0 # 预估未来最大并行流度 (基于最严酷的1个槽位预估)
     
     # [Loss Balancing & Critic Isolation 2026-02-22]
     c_policy = 1.0                  # Policy Loss 权重

@@ -461,6 +461,26 @@ class AirLineEnv_Graph(gym.Env):
         t_real = (t_std * n_demand) / effective_capacity
         return t_real
 
+    def _get_estimated_cmax(self):
+        """
+        [Phase 7: Estimated Cmax]
+        计算预估完工期 (Estimated Cmax)，用于指导单步截断的强化学习，防止智能体恶意推迟长耗时任务。
+        Cmax_est = max( 当前最大完工期, 各站位平均完工期 + (未排队任务总标准耗时 / 站位数 * 预估槽位) )
+        """
+        curr_max = np.max(self.station_wall_clock)
+        
+        # 取未分配的任务：0=Wait, 1=Ready
+        unassigned_mask = (self.task_status == 0) | (self.task_status == 1)
+        unassigned_sum = self.task_static_feat[unassigned_mask, 0].sum().item()
+        
+        from configs import configs
+        slots = getattr(configs, 'estimated_cmax_station_slots', 1.0)
+        
+        curr_mean = np.mean(self.station_wall_clock)
+        lower_bound = curr_mean + (unassigned_sum / (self.num_stations * slots))
+        
+        return max(curr_max, lower_bound)
+
     def step(self, action):
         """
         执行一步动作。
@@ -469,7 +489,8 @@ class AirLineEnv_Graph(gym.Env):
         task_id, station_id, team = action
         
         # 记录执行前的 makespan 与平衡差 (Telescoping Sum Calculation Base)
-        prev_makespan = np.max(self.station_wall_clock)
+        # [Phase 7: Estimated Cmax] 变更为具备下界预测能力的 Cmax_est
+        prev_makespan = self._get_estimated_cmax()
         prev_std = np.std(self.station_loads)
         
         # 1. 执行逻辑
@@ -576,8 +597,8 @@ class AirLineEnv_Graph(gym.Env):
         reward -= blocked_penalty
         '''
         # E. Dense Telescoping Makespan Reward (取代原来的稀疏惩罚)
-        # 用真实的 Wall-Clock Makespan 来引导强化学习的步进 Delta 预测
-        curr_makespan = np.max(self.station_wall_clock)
+        # [Phase 7: Estimated Cmax] 用预估的 Cmax_est 替代真实的 Wall-Clock
+        curr_makespan = self._get_estimated_cmax()
         curr_std = np.std(self.station_loads)
         
         delta_makespan = curr_makespan - prev_makespan
