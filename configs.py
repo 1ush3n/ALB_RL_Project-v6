@@ -50,13 +50,15 @@ class configs:
     
     lr = 1e-4                       # 初始学习率 (3000节点序列极长，不可轻易放大以免陷入局部最优死坑)
     gamma = 0.9995                  # [治病良方：时间折现因子] 3000步超级长线，必须将远视能力拉满！(1 / (1-0.9995) = 2000步视野)
-    k_epochs = 4                    # 每次更新循环次数 (从 2 上调至 4，由于当前 KL 极小说明每次榨取的数据不足，应该对同批数据多更新几次来逼近目标 KL)
+    k_epochs = 4                    # 每次更新循环次数
     eps_clip = 0.2                  # PPO Clip阈值 (e.g. 0.1 ~ 0.2)
-    batch_size = 2                 # [防 OOM + 性能提升] 适当放宽至 8 兼顾 8G 显存稳定性
+    # [Phase 6: OOM Warning Mitigation] 对于双流大图的 8G 显存优化
+    batch_size = 4                 # [双骨干显存翻倍] 退回至 4，严防 RTX 4060 爆显存
     
     # [Loss Balancing & Critic Isolation 2026-02-22]
     c_policy = 1.0                  # Policy Loss 权重
-    c_value = 0.05                   # [已通过 Huber Loss 防爆] 安全调回标准的 0.5，Critic 不会再破坏全局梯度
+    # [Phase 6: Critic Isolation]
+    c_value = 0.5                   # [双流架构完全解绑] 安全调回原神级别的 0.5，Critic 梯度将畅通无阻且不再腐蚀 Actor
     
     # [Reward Coefficients 2026-03-12]
     r_coef_makespan = 1.0           # 宏观目标：Makespan 下班时间推移惩罚 (极其容易稀疏，因为只看瓶颈)
@@ -68,8 +70,9 @@ class configs:
     # [针对 3000 单的长序列防死锁补丁] 面对巨量状态，初期随机性非常关键。不可过低。
     c_entropy = 0.05                
     # [Entropy Annealing 2026-03-11] 强制智能体在后期收紧探索，不要摆烂
-    c_entropy_end = 0.01            # 熵衰减的终点 (上调以免重蹈后期 Policy 极端自信后崩溃引发 Loss 的覆辙)
-    entropy_decay_episodes = 200    # 用多少代将 c_entropy 从初始值平滑降至 c_entropy_end
+    c_entropy_end = 0.01            # 熵衰减的终点
+    # [Phase 6: Attention Warmup]
+    entropy_decay_episodes = 1000   # 大幅延长探索期！给新生的双流 Critic 睁眼看世界的时间
     accumulation_steps = 128       # [防过拟合核心机制] 在内存中聚集高达 16*128=2048 步全局经验后才做 1 次 PPO Update！严防过快更新导致跌入“死磕前几个节点”的局部最优！
     gae_lambda = 0.98               # GAE 优势函数的衰减因子 (适配 3000 极长序列，将长期优势传导给前置任务)
     use_muon = True                 # 是否使用 Muon 优化器进行 2D 张量的更新

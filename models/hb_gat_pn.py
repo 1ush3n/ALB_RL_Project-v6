@@ -92,7 +92,9 @@ class HeteroGATEncoder(nn.Module):
 class TaskPointer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.context_proj = nn.Linear(config.hidden_dim * 6, config.hidden_dim) # 扩展为 Mean+Max 拼接后的 6 倍维度
+        from configs import configs
+        c_dim = config.hidden_dim * 3 if getattr(configs, 'use_attention_critic', True) else config.hidden_dim * 6
+        self.context_proj = nn.Linear(c_dim, config.hidden_dim) # 动态支持 Attention Pooling 或 Full Max+Mean
         self.task_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.attn = nn.Linear(config.hidden_dim, 1)
         
@@ -247,7 +249,9 @@ class HBGATPN(nn.Module):
         self.worker_head = WorkerPointer(config)
         
         # 3. 价值网络 (Critic) 
-        # 用于 PPO 的 Advantage 计算
+        # [Phase 6: Dual-Stream Critic] 独立骨干网络
+        self.critic_embedder = FeatureEmbedder(config)
+        self.critic_encoder = HeteroGATEncoder(config)
         
         from configs import configs
         # [Phase 5: Attention Pooling Optimization B]
@@ -355,5 +359,80 @@ class HBGATPN(nn.Module):
              
         return x_dict_encoded, global_context
 
-    def get_value(self, global_context):
-        return self.critic(global_context)
+    def get_value(self, batch_data):
+        """
+        [Phase 6: Dual-Stream Critic]
+        Critic 拥有自己完整的前向传播，与 Actor 的表征完全解耦
+        """
+        # 1. 独立编码
+        c_x_dict = self.critic_embedder(batch_data.x_dict)
+        
+        from configs import configs
+        if getattr(configs, 'ablation_no_gat', False):
+            c_x_dict_encoded = c_x_dict
+        else:
+            c_x_dict_encoded = self.critic_encoder(c_x_dict, batch_data.edge_index_dict)
+            
+        from torch_geometric.utils import softmax
+        
+        # 2. 独立池化 (Attention or Mean+Max)
+        if getattr(configs, 'use_attention_critic', True) and hasattr(batch_data['station'], 'batch') and batch_data['station'].batch is not None:
+             s_batch = batch_data['station'].batch
+             t_batch = batch_data['task'].batch
+             w_batch = batch_data['worker'].batch
+             
+             s_weights = self.station_attn(c_x_dict_encoded['station'])
+             s_alphas = softmax(s_weights, s_batch)
+             from torch_geometric.nn import global_add_pool
+             station_ctx = global_add_pool(c_x_dict_encoded['station'] * s_alphas, s_batch)
+             
+             t_weights = self.task_worker_attn(c_x_dict_encoded['task'])
+             t_alphas = softmax(t_weights, t_batch)
+             task_ctx = global_add_pool(c_x_dict_encoded['task'] * t_alphas, t_batch)
+             
+             w_weights = self.task_worker_attn(c_x_dict_encoded['worker'])
+             w_alphas = softmax(w_weights, w_batch)
+             worker_ctx = global_add_pool(c_x_dict_encoded['worker'] * w_alphas, w_batch)
+             
+             c_global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1)
+             self.last_s_weights = s_weights.detach()
+             
+        elif getattr(configs, 'use_attention_critic', True):
+             s_weights = self.station_attn(c_x_dict_encoded['station'])
+             s_alphas = F.softmax(s_weights, dim=0)
+             station_ctx = torch.sum(c_x_dict_encoded['station'] * s_alphas, dim=0, keepdim=True)
+             
+             t_weights = self.task_worker_attn(c_x_dict_encoded['task'])
+             t_alphas = F.softmax(t_weights, dim=0)
+             task_ctx = torch.sum(c_x_dict_encoded['task'] * t_alphas, dim=0, keepdim=True)
+             
+             w_weights = self.task_worker_attn(c_x_dict_encoded['worker'])
+             w_alphas = F.softmax(w_weights, dim=0)
+             worker_ctx = torch.sum(c_x_dict_encoded['worker'] * w_alphas, dim=0, keepdim=True)
+             
+             c_global_context = torch.cat([station_ctx, task_ctx, worker_ctx], dim=1) 
+             self.last_s_weights = s_weights.detach()
+             
+        elif hasattr(batch_data['station'], 'batch') and batch_data['station'].batch is not None:
+             station_mean = global_mean_pool(c_x_dict_encoded['station'], batch_data['station'].batch)
+             task_mean = global_mean_pool(c_x_dict_encoded['task'], batch_data['task'].batch)
+             worker_mean = global_mean_pool(c_x_dict_encoded['worker'], batch_data['worker'].batch)
+             
+             station_max = global_max_pool(c_x_dict_encoded['station'], batch_data['station'].batch)
+             task_max = global_max_pool(c_x_dict_encoded['task'], batch_data['task'].batch)
+             worker_max = global_max_pool(c_x_dict_encoded['worker'], batch_data['worker'].batch)
+             
+             c_global_context = torch.cat([station_mean, task_mean, worker_mean, station_max, task_max, worker_max], dim=1)
+        else:
+             station_mean = torch.mean(c_x_dict_encoded['station'], dim=0, keepdim=True)
+             task_mean = torch.mean(c_x_dict_encoded['task'], dim=0, keepdim=True)
+             worker_mean = torch.mean(c_x_dict_encoded['worker'], dim=0, keepdim=True)
+             
+             station_max = torch.max(c_x_dict_encoded['station'], dim=0, keepdim=True)[0]
+             task_max = torch.max(c_x_dict_encoded['task'], dim=0, keepdim=True)[0]
+             worker_max = torch.max(c_x_dict_encoded['worker'], dim=0, keepdim=True)[0]
+             
+             c_global_context = torch.cat([station_mean, task_mean, worker_mean, station_max, task_max, worker_max], dim=1)
+             
+        # 3. 输出价值
+        return self.critic(c_global_context)

@@ -421,9 +421,11 @@ class PPOAgent:
                 
                 # 当前策略的前向传播
                 x_dict, global_context = self.policy(batch)
-                # [CRITICAL FIX: Critic Detachment]
-                # state_values = self.policy.get_value(global_context).view(-1)
-                state_values = self.policy.get_value(global_context.detach()).view(-1)
+                
+                # [CRITICAL Phase 6: Dual-Stream Critic Evaluation]
+                # 传入完整的 batch，由 Critic 独立的 Embedder 和 Encoder 提取特征，不与 Actor 共享骨干！
+                # 并且去除了 .detach()，让梯度真正在 Critic 内部乃至 Attention Pooling 中流动！
+                state_values = self.policy.get_value(batch).view(-1)
                 
                 # --- Re-evaluate LogProbs ---
                 # A. Task LogProb
@@ -612,9 +614,10 @@ class PPOAgent:
                 
                 # Log Stats (取消除以 accumulation_steps 来显示真实 loss 幅度)
                 avg_loss += loss.item() * self.accumulation_steps
+                # [Phase 6: Logging Raw, Unscaled Losses (Loss Transparency)]
                 avg_policy_loss += policy_loss.item()
-                avg_value_loss += value_loss.item()
-                avg_entropy_loss += entropy_loss.item()
+                avg_value_loss += self.MseLoss(state_values, b_reward).item() # 记录原味均方误差
+                avg_entropy_loss += entropy.mean().item() # 记录最本源的策略熵 (不含截断)
             
             # [CRITICAL FIX: Epoch Early Stopping for Trust Region Protection]
             # 计算当前 epoch 的平均 KL
