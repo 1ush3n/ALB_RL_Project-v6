@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
@@ -415,7 +416,11 @@ class PPOAgent:
             self.optimizer_adam.zero_grad()
             
         final_epoch = self.k_epochs - 1
+        kl_meltdown = False # [Phase 8: KL Armor]
+        
         for i_epoch in range(self.k_epochs):
+            if kl_meltdown: break
+            
             epoch_kls = []
             for step_idx, batch in enumerate(loader):
                 batch = batch.to(self.device)
@@ -550,7 +555,11 @@ class PPOAgent:
                     log_ratio = total_lp - batch.y_logprob.view(-1)
                     approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
                     epoch_kls.append(approx_kl.item())
-                    
+                # [Phase 8: Inner-Batch KL Meltdown Protection]
+                if approx_kl.item() > getattr(configs, 'kl_early_stop', 0.03):
+                    print(f"      [EMERGENCY STOP] Batch {step_idx}: KL={approx_kl.item():.4f} > Break Threshold. Aborting PPO update to protect Policy.")
+                    kl_meltdown = True
+                    break
                 ratios = torch.exp(total_lp - batch.y_logprob.view(-1))
                 
                 # Use GAE advantages if available, else batch.y_reward - state_values (MC fallback)
@@ -578,19 +587,19 @@ class PPOAgent:
                 
                 c_ent_base = getattr(configs, 'c_entropy', 0.05)
                 c_ent_end = getattr(configs, 'c_entropy_end', 0.01)
-                
-                # 线性衰减
-                c_ent = c_ent_base - ent_progress * (c_ent_base - c_ent_end)
+                # [Phase 8: Exponential Entropy Decay]
+                # 指数衰减 (比线性更平滑，在初期下降快，后期保留长久的微弱探索尾巴)
+                import math
+                c_ent = c_ent_end + (c_ent_base - c_ent_end) * math.exp(-3.0 * ent_progress)
                 
                 c_pol = getattr(configs, 'c_policy', 1.0)
                 
-                # [CRITICAL FIX: MSE Loss & No Clipping]
+                # [Phase 8: Critic Armor (Huber Loss / SmoothL1 Loss)]
                 b_reward = batch.y_reward.view(-1)
                 
-                # 因为 Return 已经被恰当地标准化，我们不需要再用畸形的 Delta=10 Huber Loss，
-                # 也无需任何可能引发拟合死锁的 Value Clipping (0.2 的 EPS 会使得几万的残差永远无法收敛)。
-                # 直接采取标准的 MSE Loss 即为学术界针对极大/负分长序列环境的最优应对:
-                value_loss = c_val * self.MseLoss(state_values, b_reward)
+                # 为了防止死锁的 -50 满额惩罚在单纯的 MSE 中引发上千的核爆均方梯度的击穿，
+                # 改用 SmoothL1Loss，对 < beta 的温和误差使用平方，对 > beta 的极端误差使用绝对值削平。
+                value_loss = c_val * F.smooth_l1_loss(state_values, b_reward, beta=5.0)
                      
                 entropy_loss = -c_ent * entropy.mean()
                 
@@ -602,8 +611,14 @@ class PPOAgent:
                 
                 # [Gradient Accumulation]
                 if ((step_idx + 1) % self.accumulation_steps == 0) or (step_idx + 1 == len(loader)):
-                    # [Gradient Clipping]
-                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
+                    # [Phase 8: Independent Gradient Clipping]
+                    # 分别搜集 Actor 和 Critic 的参数，由于双流网络已解绑，Critic 对大梯度的耐受力远弱于 Actor。
+                    actor_params = [p for n, p in self.policy.named_parameters() if 'critic' not in n and 'attn' not in n]
+                    critic_params = [p for n, p in self.policy.named_parameters() if 'critic' in n or 'attn' in n]
+                    
+                    torch.nn.utils.clip_grad_norm_(actor_params, max_norm=0.5)
+                    # 给 Critic 挂装远比 Actor 更薄弱的装甲 (0.1)，防止局部脉冲带崩全盘
+                    torch.nn.utils.clip_grad_norm_(critic_params, max_norm=getattr(configs, 'clip_v_grad_norm', 0.1))
                     
                     self.optimizer.step()
                     if self.using_muon:
@@ -617,7 +632,7 @@ class PPOAgent:
                 avg_loss += loss.item() * self.accumulation_steps
                 # [Phase 6: Logging Raw, Unscaled Losses (Loss Transparency)]
                 avg_policy_loss += policy_loss.item()
-                avg_value_loss += self.MseLoss(state_values, b_reward).item() # 记录原味均方误差
+                avg_value_loss += F.smooth_l1_loss(state_values, b_reward, beta=5.0).item() # 记录受护甲保护后的真实误差
                 avg_entropy_loss += entropy.mean().item() # 记录最本源的策略熵 (不含截断)
             
             # [CRITICAL FIX: Epoch Early Stopping for Trust Region Protection]

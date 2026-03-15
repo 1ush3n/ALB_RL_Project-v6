@@ -52,6 +52,8 @@ class configs:
     gamma = 0.9995                  # [治病良方：时间折现因子] 3000步超级长线，必须将远视能力拉满！(1 / (1-0.9995) = 2000步视野)
     k_epochs = 4                    # 每次更新循环次数
     eps_clip = 0.2                  # PPO Clip阈值 (e.g. 0.1 ~ 0.2)
+    # [Phase 8: Critic Armor] 专门为脆弱的 Value Network 设置 1/5 强度的梯度防破甲护盾
+    clip_v_grad_norm = 0.1
     # [Phase 6: OOM Warning Mitigation] 对于双流大图的 8G 显存优化
     batch_size = 4                 # [双骨干显存翻倍] 退回至 4，严防 RTX 4060 爆显存
     max_slots_per_station = 15      # 物理环境:每个站位允许的最大并行工序数
@@ -91,6 +93,8 @@ class configs:
     
     # [Adaptive KL Learning Rate Schedule 2026-03-13]
     target_kl = 0.015               # 策略目标 KL 散度（衡量新旧策略差异的距离指标），用于自适应学习率调整。
+    # [Phase 8: KL Armor] 绝对熔断阈值，但凡哪个 Batch 内部超过了这个值，立刻放弃后续利用，保护 Trust Region。
+    kl_early_stop = 0.03            
     lr_warmup_steps = 3             # 学习率预热步数 (Linear Warmup)
     min_lr = 1e-6                   # 最小学习率保护下界
     lr_max = 3e-4                   # 最大学习率保护上界 (限制为 3e-4，防止自适应 LR 过大导致参数崩坏)

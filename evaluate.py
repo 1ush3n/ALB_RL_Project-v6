@@ -85,7 +85,7 @@ def evaluate(args):
             task_mask, station_mask, worker_mask = env.get_masks()
             
             # 引入温度采样的推理选择
-            action, _, _, _ = agent.select_action(
+            action, _, _, _, _ = agent.select_action(
                 state.to(device),
                 mask_task=task_mask.to(device),
                 mask_station_matrix=station_mask.to(device),
